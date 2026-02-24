@@ -1,0 +1,85 @@
+[workspace.package]
+authors = [""]
+edition = "2021"
+license = "Unlicense"
+repository = ""
+
+[workspace]
+resolver = "2"
+members = [
+	"node",
+	"runtime",
+	"pallets/mental-poker",
+]
+
+[workspace.dependencies]
+# Local
+pallet-mental-poker = { path = "pallets/mental-poker", default-features = false }
+mental-poker-runtime = { path = "runtime", default-features = false }
+
+# Polkadot SDK (umbrella — node only)
+polkadot-sdk = { path = "../polkadot-sdk/umbrella", default-features = false }
+
+# Frame core
+frame-executive = { path = "../polkadot-sdk/substrate/frame/executive", default-features = false }
+frame-support = { path = "../polkadot-sdk/substrate/frame/support", default-features = false }
+frame-system = { path = "../polkadot-sdk/substrate/frame/system", default-features = false }
+
+# Frame pallets
+pallet-balances = { path = "../polkadot-sdk/substrate/frame/balances", default-features = false }
+pallet-sudo = { path = "../polkadot-sdk/substrate/frame/sudo", default-features = false }
+pallet-timestamp = { path = "../polkadot-sdk/substrate/frame/timestamp", default-features = false }
+pallet-transaction-payment = { path = "../polkadot-sdk/substrate/frame/transaction-payment", default-features = false }
+
+# Substrate primitives
+sp-api = { path = "../polkadot-sdk/substrate/primitives/api", default-features = false }
+sp-block-builder = { path = "../polkadot-sdk/substrate/primitives/block-builder", default-features = false }
+sp-core = { path = "../polkadot-sdk/substrate/primitives/core", default-features = false }
+sp-genesis-builder = { path = "../polkadot-sdk/substrate/primitives/genesis-builder", default-features = false }
+sp-inherents = { path = "../polkadot-sdk/substrate/primitives/inherents", default-features = false }
+sp-keyring = { path = "../polkadot-sdk/substrate/primitives/keyring", default-features = false }
+sp-offchain = { path = "../polkadot-sdk/substrate/primitives/offchain", default-features = false }
+sp-runtime = { path = "../polkadot-sdk/substrate/primitives/runtime", default-features = false }
+sp-session = { path = "../polkadot-sdk/substrate/primitives/session", default-features = false }
+sp-storage = { path = "../polkadot-sdk/substrate/primitives/storage", default-features = false }
+sp-transaction-pool = { path = "../polkadot-sdk/substrate/primitives/transaction-pool", default-features = false }
+sp-version = { path = "../polkadot-sdk/substrate/primitives/version", default-features = false }
+
+# RPC runtime APIs
+frame-system-rpc-runtime-api = { path = "../polkadot-sdk/substrate/frame/system/rpc/runtime-api", default-features = false }
+pallet-transaction-payment-rpc-runtime-api = { path = "../polkadot-sdk/substrate/frame/transaction-payment/rpc/runtime-api", default-features = false }
+
+# Build deps
+substrate-wasm-builder = { path = "../polkadot-sdk/substrate/utils/wasm-builder", default-features = true }
+
+# SCALE
+codec = { version = "3.7.5", default-features = false, package = "parity-scale-codec" }
+scale-info = { version = "2.11.6", default-features = false }
+
+# Mental Poker
+cards-protocol = { path = "../mental-poker/protocol", default-features = false }
+cards-proofs = { path = "../mental-poker/proofs", default-features = false }
+cards-deck = { path = "../mental-poker/deck", default-features = false }
+deck-secp256k1 = { path = "../mental-poker/deck-secp256k1", default-features = false }
+
+# Arkworks
+ark-ec = { version = "0.5.0", default-features = false }
+ark-ff = { version = "0.5.0", default-features = false }
+ark-serialize = { version = "0.5.0", default-features = false }
+ark-std = { version = "0.5.0", default-features = false }
+ark-secp256k1 = { version = "0.5.0", default-features = false }
+ark-transcript = { version = "0.0.5", default-features = false }
+
+# Node dependencies
+clap = { version = "4.5.13" }
+docify = { version = "0.2.9" }
+futures = { version = "0.3.31" }
+futures-timer = { version = "3.0.2" }
+jsonrpsee = { version = "0.24.10" }
+serde_json = { version = "1.0.132", default-features = false }
+
+[workspace.lints.rust]
+unused = "allow"
+
+[profile.release]
+panic = "unwind"

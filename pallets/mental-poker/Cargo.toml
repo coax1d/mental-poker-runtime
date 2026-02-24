@@ -1,0 +1,46 @@
+[package]
+name = "pallet-mental-poker"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+codec = { features = ["derive"], workspace = true }
+scale-info = { features = ["derive"], workspace = true }
+frame-support = { features = ["experimental"], workspace = true }
+frame-system = { workspace = true }
+
+# Mental Poker
+cards-protocol = { workspace = true }
+cards-proofs = { workspace = true }
+cards-deck = { workspace = true }
+deck-secp256k1 = { workspace = true }
+
+# Arkworks
+ark-ec = { workspace = true }
+ark-ff = { workspace = true }
+ark-serialize = { workspace = true }
+ark-std = { workspace = true }
+ark-secp256k1 = { workspace = true }
+ark-transcript = { workspace = true }
+
+[features]
+default = ["std"]
+std = [
+	"codec/std",
+	"scale-info/std",
+	"frame-support/std",
+	"frame-system/std",
+	"cards-protocol/std",
+	"cards-proofs/std",
+	"cards-deck/std",
+	"deck-secp256k1/std",
+	"ark-ec/std",
+	"ark-ff/std",
+	"ark-serialize/std",
+	"ark-std/std",
+	"ark-secp256k1/std",
+	"ark-transcript/std",
+]
