@@ -9,7 +9,12 @@
 import type { TypedApi } from "./chain";
 import * as chain from "./chain";
 import * as crypto from "./crypto";
-import type { PlayerData } from "./crypto";
+import type {
+  PlayerData,
+  PlayerKeypair,
+  MaskedDeck,
+  AggregatedKeys,
+} from "./crypto";
 import type { DevAccount } from "./accounts";
 import {
   type GameState,
@@ -35,7 +40,8 @@ export interface HarnessConfig {
 
 interface PlayerInfo {
   account: DevAccount;
-  crypto: PlayerData;
+  data: PlayerData;
+  keypair: PlayerKeypair;
 }
 
 export class GameHarness {
@@ -48,8 +54,8 @@ export class GameHarness {
   private players: PlayerInfo[] = [];
   private gameId = 0;
   private state: GameState;
-  private currentDeck: Uint8Array = new Uint8Array();
-  private aggKeyBytes: Uint8Array = new Uint8Array();
+  private currentDeck!: MaskedDeck;
+  private aggKeys!: AggregatedKeys;
   private stopped = false;
 
   constructor(config: HarnessConfig) {
@@ -98,8 +104,9 @@ export class GameHarness {
 
     this.log("setup", "Generating player keys...");
     for (const account of this.accounts) {
-      const playerCrypto = crypto.generatePlayer(account.publicKey);
-      this.players.push({ account, crypto: playerCrypto });
+      const data = crypto.generatePlayer(account.publicKey);
+      const keypair = data.keypair();
+      this.players.push({ account, data, keypair });
     }
 
     this.log("setup", `Creating game (${this.deckSize} cards, ${this.accounts.length} players)...`);
@@ -120,11 +127,12 @@ export class GameHarness {
     for (const player of this.players) {
       if (this.stopped) return;
       this.log("registering", `Registering ${player.account.name}...`);
+      const helloBytes = player.data.hello().to_bytes();
       await chain.registerPlayer(
         this.api,
         player.account.signer,
         this.gameId,
-        player.crypto.helloBytes,
+        helloBytes,
       );
       this.log("registering", `${player.account.name} registered.`);
       await this.delay();
@@ -137,16 +145,15 @@ export class GameHarness {
   private async phaseMask(): Promise<void> {
     this.updatePhase("masking");
     this.log("masking", "Creating zero-masked deck...");
-    const maskedDeck = crypto.zeroMaskDeck(this.deckSize);
+    this.currentDeck = crypto.zeroMaskDeck(this.deckSize);
 
     this.log("masking", "Submitting masked deck to chain...");
     await chain.submitMaskedDeck(
       this.api,
       this.players[0].account.signer,
       this.gameId,
-      maskedDeck,
+      this.currentDeck.to_bytes(),
     );
-    this.currentDeck = maskedDeck;
     this.log("masking", "Deck masked and submitted.");
     await this.delay();
   }
@@ -157,30 +164,33 @@ export class GameHarness {
     this.updatePhase("shuffling");
 
     // Read aggregate key data from chain
-    this.aggKeyBytes = await chain.readAggregateKeyData(this.api, this.gameId);
+    const aggKeyRaw = await chain.readAggregateKeyData(this.api, this.gameId);
+    this.aggKeys = crypto.aggKeysFromBytes(aggKeyRaw);
 
     for (const player of this.players) {
       if (this.stopped) return;
       this.log("shuffling", `${player.account.name} shuffling (generating ZK proof)...`);
 
       // Read current deck from chain
-      this.currentDeck = await chain.readCurrentDeck(this.api, this.gameId);
+      const deckRaw = await chain.readCurrentDeck(this.api, this.gameId);
+      this.currentDeck = crypto.deckFromBytes(deckRaw);
 
-      const shuffleMsg = crypto.shuffleDeck(this.aggKeyBytes, this.currentDeck);
+      const shuffleMsg = this.aggKeys.shuffle(this.currentDeck);
 
       this.log("shuffling", `${player.account.name} submitting shuffle proof...`);
       await chain.submitShuffle(
         this.api,
         player.account.signer,
         this.gameId,
-        shuffleMsg,
+        shuffleMsg.to_bytes(),
       );
       this.log("shuffling", `${player.account.name} shuffle verified.`);
       await this.delay();
     }
 
     // Read final shuffled deck
-    this.currentDeck = await chain.readCurrentDeck(this.api, this.gameId);
+    const finalDeckRaw = await chain.readCurrentDeck(this.api, this.gameId);
+    this.currentDeck = crypto.deckFromBytes(finalDeckRaw);
     this.log("shuffling", "All shuffles complete. Deck is ready.");
   }
 
@@ -248,15 +258,12 @@ export class GameHarness {
     cardIndex: number,
     recipientIdx: number,
   ): Promise<number> {
-    const cardBytes = crypto.getMaskedCard(this.currentDeck, cardIndex);
-    const revealMessages: Uint8Array[] = [];
+    const card = this.currentDeck.get_card(cardIndex);
+    const reveals = crypto.newReveals();
 
     // All players generate reveal tokens
     for (let p = 0; p < this.players.length; p++) {
-      const revealMsg = crypto.proveRevealToken(
-        this.players[p].crypto.keypairBytes,
-        cardBytes,
-      );
+      const revealMsg = card.prove_reveal(this.players[p].keypair);
 
       if (p !== recipientIdx) {
         // Submit to chain (other players)
@@ -265,16 +272,15 @@ export class GameHarness {
           this.players[p].account.signer,
           this.gameId,
           cardIndex,
-          revealMsg,
+          revealMsg.to_bytes(),
         );
       }
       // Collect all messages (including recipient's local one)
-      revealMessages.push(revealMsg);
+      reveals.add(revealMsg);
     }
 
     // Recipient unmasks
-    const packedReveals = crypto.packRevealMessages(revealMessages);
-    return crypto.unmaskCard(packedReveals, cardBytes);
+    return reveals.unmask(card);
   }
 
   // --- Helpers ---

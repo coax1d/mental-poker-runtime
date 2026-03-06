@@ -8,18 +8,18 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "build:wasm": "wasm-pack build ../../mental-poker/play --target web --features wasm-bindgen && rm -rf src/wasm/pkg && cp -r ../../mental-poker/play/pkg src/wasm/pkg",
-    "setup:papi": "papi add -w ws://127.0.0.1:9944 mental-poker-runtime",
+    "setup:papi": "papi add -w ws://127.0.0.1:9944 mpr",
     "setup": "npm run build:wasm && echo 'WASM built. Start the node, then run: npm run setup:papi'"
   },
   "dependencies": {
-    "polkadot-api": "^1.8.0",
+    "@polkadot-api/descriptors": "file:.papi/descriptors",
     "@polkadot-labs/hdkd": "^0.0.11",
     "@polkadot-labs/hdkd-helpers": "^0.0.13",
+    "polkadot-api": "^1.8.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
-    "@polkadot-api/descriptors": "file:.papi/descriptors",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.0",
