@@ -427,16 +427,9 @@ pub mod pallet {
 					.map_err(|_| Error::<T>::InvalidProof)?;
 			}
 
-			// Serialize the aggregate public key and player keys for later reconstruction
-			let agg_key = apk.aggregate_key();
-			let player_pks: Vec<PlayerPublicKey> = apk.players().to_vec();
-
-			// Store both aggregate key and individual public keys together
-			let mut agg_data = Vec::new();
-			ark_serialize::CanonicalSerialize::serialize_compressed(agg_key, &mut agg_data)
-				.map_err(|_| Error::<T>::InternalError)?;
-			ark_serialize::CanonicalSerialize::serialize_compressed(&player_pks, &mut agg_data)
-				.map_err(|_| Error::<T>::InternalError)?;
+			// Serialize using the AggregatedPublicKeys' own CanonicalSerialize impl,
+			// which writes Vec<PlayerPublicKey> (the aggregate key is re-derived on deser).
+			let agg_data = serialize_ark(&apk);
 
 			let bounded: BoundedVec<u8, MaxAggKeySize> =
 				agg_data.try_into().map_err(|_| Error::<T>::DataTooLarge)?;
