@@ -9,6 +9,7 @@ const CARD_ICONS: Record<string, string> = {
   ek: "EK",
   defuse: "DEF",
   safe: "OK",
+  unknown: "?",
 };
 
 export function PlayerHand({ cards, isCurrentPlayer }: Props) {
@@ -17,7 +18,11 @@ export function PlayerHand({ cards, isCurrentPlayer }: Props) {
   return (
     <div className={`player-hand ${isCurrentPlayer ? "current" : ""}`}>
       {cards.map((card, i) => (
-        <div key={i} className={`card card-${card.type}`} title={`Deck position: ${card.deckPosition}`}>
+        <div
+          key={i}
+          className={`card card-${card.type}`}
+          title={card.type === "unknown" ? "Hidden card" : `Deck position: ${card.deckPosition}`}
+        >
           <span className="card-icon">{CARD_ICONS[card.type]}</span>
           <span className="card-label">{card.type}</span>
         </div>

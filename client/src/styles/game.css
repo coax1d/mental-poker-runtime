@@ -215,6 +215,113 @@ body {
   font-weight: 700;
 }
 
+/* === Mode Toggle (Simulation / Multiplayer) === */
+.mode-toggle {
+  display: flex;
+  justify-content: center;
+  gap: 0;
+  margin-bottom: 1.5rem;
+}
+
+.mode-btn {
+  background: transparent;
+  border: 1px solid #333;
+  color: var(--text-dim);
+  padding: 0.5rem 1.25rem;
+  font-family: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.mode-btn:first-child {
+  border-radius: var(--radius) 0 0 var(--radius);
+}
+
+.mode-btn:last-child {
+  border-radius: 0 var(--radius) var(--radius) 0;
+  border-left: none;
+}
+
+.mode-active {
+  background: var(--surface-light);
+  border-color: var(--blue);
+  color: var(--blue);
+}
+
+.mode-btn:hover:not(.mode-active) {
+  color: var(--text);
+  border-color: #555;
+}
+
+/* === Action Toggle (Create / Join) === */
+.action-toggle {
+  display: flex;
+  gap: 0;
+}
+
+.action-btn {
+  flex: 1;
+  background: transparent;
+  border: 1px solid #333;
+  color: var(--text-dim);
+  padding: 0.4rem 0.75rem;
+  font-family: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.action-btn:first-child {
+  border-radius: 4px 0 0 4px;
+}
+
+.action-btn:last-child {
+  border-radius: 0 4px 4px 0;
+  border-left: none;
+}
+
+.action-active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}
+
+/* === Game ID Banner === */
+.game-id-banner {
+  text-align: center;
+  background: var(--surface);
+  padding: 0.6rem 1rem;
+  border-radius: var(--radius);
+  margin-bottom: 1rem;
+  font-size: 0.85rem;
+  color: var(--text);
+}
+
+.game-id-banner strong {
+  color: var(--yellow);
+  font-size: 1rem;
+  margin: 0 0.25rem;
+}
+
+.game-id-hint {
+  display: block;
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  margin-top: 0.2rem;
+}
+
+/* === Unknown Card === */
+.card-unknown {
+  background: rgba(136, 136, 136, 0.1);
+  border-color: #555;
+  color: var(--text-dim);
+}
+
 .error-banner {
   background: rgba(231, 76, 60, 0.2);
   border: 1px solid var(--red);

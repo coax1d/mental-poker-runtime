@@ -13,7 +13,7 @@
  *   - Last player standing wins.
  */
 
-export type CardType = "ek" | "defuse" | "safe";
+export type CardType = "ek" | "defuse" | "safe" | "unknown";
 
 export interface Card {
   deckPosition: number;
@@ -191,6 +191,58 @@ export function isGameOver(state: GameState): boolean {
   return aliveCount <= 1 || state.drawIndex >= state.deckSize;
 }
 
+/** Deal a hidden card to an opponent (multiplayer — you don't know what it is). */
+export function dealHiddenCard(
+  state: GameState,
+  playerIdx: number,
+): GameState {
+  const card: Card = { deckPosition: -1, type: "unknown" };
+  const players = state.players.map((p, i) =>
+    i === playerIdx ? { ...p, hand: [...p.hand, card] } : p,
+  );
+  return {
+    ...state,
+    players,
+    drawIndex: state.drawIndex + 1,
+    log: [
+      ...state.log,
+      {
+        phase: state.phase === "playing" ? "playing" : "dealing",
+        message: `${state.players[playerIdx].name} received a card`,
+      },
+    ],
+  };
+}
+
+/** Process a drawn card during play phase for an opponent (multiplayer — hidden). */
+export function processHiddenDraw(
+  state: GameState,
+  playerIdx: number,
+  died: boolean,
+): GameState {
+  const player = state.players[playerIdx];
+  let players = [...state.players];
+  const log = [...state.log];
+
+  if (died) {
+    players[playerIdx] = { ...player, alive: false };
+    log.push({
+      phase: "playing",
+      message: `${player.name} drew Exploding Kitten! No Defuse — eliminated!`,
+    });
+  } else {
+    // We don't know the card type — just add a hidden card
+    const card: Card = { deckPosition: -1, type: "unknown" };
+    players[playerIdx] = { ...player, hand: [...player.hand, card] };
+    log.push({
+      phase: "playing",
+      message: `${player.name} drew a card.`,
+    });
+  }
+
+  return { ...state, players, log, drawIndex: state.drawIndex + 1 };
+}
+
 /** Get a human-readable label for a card type. */
 export function cardLabel(type: CardType): string {
   switch (type) {
@@ -200,6 +252,8 @@ export function cardLabel(type: CardType): string {
       return "Defuse";
     case "safe":
       return "Safe";
+    case "unknown":
+      return "???";
   }
 }
 

@@ -11,17 +11,22 @@ import {
   mnemonicToEntropy,
 } from "@polkadot-labs/hdkd-helpers";
 import { getPolkadotSigner } from "polkadot-api/signer";
-import type { PolkadotSigner } from "polkadot-api";
+import type { PolkadotSigner, SS58String } from "polkadot-api";
+import { fromBufferToBase58 } from "@polkadot-api/substrate-bindings";
 
 const entropy = mnemonicToEntropy(DEV_PHRASE);
 const miniSecret = entropyToMiniSecret(entropy);
 const derive = sr25519CreateDerive(miniSecret);
+
+// Substrate dev node uses the generic SS58 prefix 0
+const toSS58 = fromBufferToBase58(0);
 
 export const DEV_ACCOUNT_NAMES = ["Alice", "Bob", "Charlie", "Dave", "Eve"];
 
 export interface DevAccount {
   name: string;
   publicKey: Uint8Array;
+  ss58Address: SS58String;
   signer: PolkadotSigner;
 }
 
@@ -34,9 +39,11 @@ export function getDevAccount(name: string): DevAccount {
 
   const keypair = derive(`//${name}`);
   const signer = getPolkadotSigner(keypair.publicKey, "Sr25519", keypair.sign);
+  const ss58Address = toSS58(keypair.publicKey);
   const account: DevAccount = {
     name,
     publicKey: keypair.publicKey,
+    ss58Address,
     signer,
   };
   cache.set(name, account);
