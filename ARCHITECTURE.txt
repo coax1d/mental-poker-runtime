@@ -1,0 +1,85 @@
+Mental Poker Runtime — How the protocol crate is used
+=====================================================
+
+The pallet at pallets/mental-poker/ is the on-chain component. It stores
+game state and verifies zero-knowledge proofs submitted by players.
+
+Type bindings (types.rs)
+------------------------
+All protocol types are bound to secp256k1:
+
+  Curve            = ark_secp256k1::Projective
+  CardParameters   = cards_protocol::Parameters<Curve>
+  MaskedCard       = cards_protocol::MaskedCard<Curve>
+  UnmaskedCard     = cards_protocol::UnmaskedCard<Curve>
+  PlayerHello      = cards_protocol::keys::PlayerHello<Curve>
+  PlayerPublicKey  = cards_protocol::keys::PlayerPublicKey<Curve>
+  AggregatedPublicKeys = cards_protocol::keys::AggregatedPublicKeys<Curve>
+  ShuffleMessage   = cards_protocol::shuffle::ShuffleMessage<Curve>
+  RevealMessage    = cards_protocol::RevealMessage<Curve>
+  RevealToken      = cards_protocol::RevealToken<Curve>
+
+Helper functions serialize_ark/deserialize_ark wrap arkworks
+CanonicalSerialize/CanonicalDeserialize for on-chain storage.
+
+Extrinsics (lib.rs)
+-------------------
+
+0. create_game(deck_size, num_players)
+   - Loads params via deck_secp256k1::PARAMS.clone()
+   - Calls params.check_deck_size() to validate
+   - Creates game storage with Registration phase
+   - Weight: 100k
+
+1. register_player(game_id, player_hello_bytes)
+   - Deserializes PlayerHello (public key + key ownership ZK proof)
+   - Calls params.verify_player(&player_hello, name) to verify proof
+   - When all players registered, calls aggregate_keys() which:
+     * Creates AggregatedPublicKeys via params.create_aggregate_keys()
+     * For each player: apk.verify_n_add(player_hello, name)
+     * Stores serialized aggregate key + individual public keys
+   - Transitions to Masking phase
+   - Weight: 500k
+
+2. submit_masked_deck(game_id, masked_deck_bytes)
+   - Deserializes Vec<MaskedCard>
+   - Validates deck length matches game.deck_size
+   - Stores deck, transitions to Shuffling phase
+   - Weight: 1M
+
+3. submit_shuffle(game_id, shuffle_msg_bytes)
+   - Enforces player turn order via PlayerOrder + ShuffleIndex
+   - Deserializes ShuffleMessage (shuffled deck + ZK proof)
+   - Reconstructs AggregatedPublicKeys from stored player hellos
+   - Calls apk.verify_shuffle(&current_deck, &shuffle_msg)
+     This is the heaviest operation: verifies a ZK proof that the
+     deck was correctly permuted without revealing the permutation
+   - Updates stored deck with new shuffled version
+   - After all players shuffle, transitions to Playing phase
+   - Weight: 50M
+
+4. submit_reveal(game_id, card_index, reveal_msg_bytes)
+   - Deserializes RevealMessage (reveal token + ZK proof)
+   - Calls params.verify_single_reveal(&reveal_msg)
+   - Stores reveal token per (game, card, player)
+   - When all players submit reveals for a card, emits CardRevealed
+   - Weight: 1M
+
+Game flow
+---------
+Registration -> Masking -> Shuffling -> Playing -> (Complete)
+
+Each phase gate ensures extrinsics are called in the correct order.
+All cryptographic verification happens on-chain via the cards-protocol
+and cards-proofs crates compiled to WASM (wasm32v1-none target).
+
+Dependencies
+------------
+The pallet depends on:
+  cards-protocol   — protocol logic (parameters, keys, masking, shuffle, reveal)
+  cards-proofs     — ZK proof primitives (Chaum-Pedersen, Schnorr, etc.)
+  cards-deck       — deck representation and encode/decode
+  deck-secp256k1   — pre-generated parameters for secp256k1 curve
+  ark-*            — arkworks elliptic curve and serialization libraries
+
+All dependencies must be no_std compatible for the WASM runtime build.
