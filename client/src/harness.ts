@@ -10,10 +10,9 @@ import type { TypedApi } from "./chain";
 import * as chain from "./chain";
 import * as crypto from "./crypto";
 import type {
-  PlayerData,
   PlayerKeypair,
-  MaskedDeck,
-  AggregatedKeys,
+  MaskedCards,
+  AggregatedPublicKeys,
 } from "./crypto";
 import type { DevAccount } from "./accounts";
 import {
@@ -40,8 +39,8 @@ export interface HarnessConfig {
 
 interface PlayerInfo {
   account: DevAccount;
-  data: PlayerData;
   keypair: PlayerKeypair;
+  helloBytes: Uint8Array;
 }
 
 export class GameHarness {
@@ -54,8 +53,8 @@ export class GameHarness {
   private players: PlayerInfo[] = [];
   private gameId = 0;
   private state: GameState;
-  private currentDeck!: MaskedDeck;
-  private aggKeys!: AggregatedKeys;
+  private currentDeck!: MaskedCards;
+  private aggKeys!: AggregatedPublicKeys;
   private stopped = false;
 
   constructor(config: HarnessConfig) {
@@ -104,9 +103,8 @@ export class GameHarness {
 
     this.log("setup", "Generating player keys...");
     for (const account of this.accounts) {
-      const data = crypto.generatePlayer(account.publicKey);
-      const keypair = data.keypair();
-      this.players.push({ account, data, keypair });
+      const { keypair, helloBytes } = crypto.generatePlayer(account.publicKey);
+      this.players.push({ account, keypair, helloBytes });
     }
 
     this.log("setup", `Creating game (${this.deckSize} cards, ${this.accounts.length} players)...`);
@@ -127,12 +125,11 @@ export class GameHarness {
     for (const player of this.players) {
       if (this.stopped) return;
       this.log("registering", `Registering ${player.account.name}...`);
-      const helloBytes = player.data.hello().to_bytes();
       await chain.registerPlayer(
         this.api,
         player.account.signer,
         this.gameId,
-        helloBytes,
+        player.helloBytes,
       );
       this.log("registering", `${player.account.name} registered.`);
       await this.delay();
@@ -152,7 +149,7 @@ export class GameHarness {
       this.api,
       this.players[0].account.signer,
       this.gameId,
-      this.currentDeck.to_bytes(),
+      this.currentDeck.serialize(),
     );
     this.log("masking", "Deck masked and submitted.");
     await this.delay();
@@ -175,14 +172,14 @@ export class GameHarness {
       const deckRaw = await chain.readCurrentDeck(this.api, this.gameId);
       this.currentDeck = crypto.deckFromBytes(deckRaw);
 
-      const shuffleMsg = this.aggKeys.shuffle(this.currentDeck);
+      const shuffleMsgBytes = this.aggKeys.shuffle_and_remask(player.keypair, this.currentDeck);
 
       this.log("shuffling", `${player.account.name} submitting shuffle proof...`);
       await chain.submitShuffle(
         this.api,
         player.account.signer,
         this.gameId,
-        shuffleMsg.to_bytes(),
+        shuffleMsgBytes,
       );
       this.log("shuffling", `${player.account.name} shuffle verified.`);
       await this.delay();
@@ -225,10 +222,21 @@ export class GameHarness {
       this.log("playing", `${player.name}'s turn — drawing a card...`);
 
       const cardIndex = this.state.drawIndex;
+
+      // Check if player has a defuse BEFORE drawing (processDrawnCard removes it)
+      const hadDefuse = player.hand.some((c) => c.type === "defuse");
+
       const position = await this.privateReveal(cardIndex, playerIdx);
+      const drawnType = crypto.cardType(position, this.state.numPlayers);
+
       this.state = processDrawnCard(this.state, playerIdx, position);
       this.emitUpdate();
       await this.delay();
+
+      // If the player drew an EK and defused it, reshuffle the remaining deck
+      if (drawnType === "ek" && hadDefuse && !this.stopped) {
+        await this.performReshuffle(cardIndex);
+      }
 
       if (isGameOver(this.state)) break;
       this.state = nextTurn(this.state);
@@ -241,6 +249,70 @@ export class GameHarness {
       this.state = nextTurn(this.state); // sets winner if game over
       this.updatePhase("finished");
     }
+  }
+
+  /**
+   * Reshuffle the remaining deck after an EK is defused.
+   * Builds a sub-deck from the remaining undrawn cards + the EK card,
+   * submits it for reshuffling, then all players shuffle it.
+   */
+  private async performReshuffle(ekCardIndex: number): Promise<void> {
+    this.log("reshuffling", "Exploding Kitten defused! Reshuffling remaining deck...");
+    this.updatePhase("reshuffling");
+
+    // Save the EK card bytes before building sub-deck
+    const ekCardBytes = new Uint8Array(this.currentDeck.get_card(ekCardIndex));
+
+    // Build sub-deck: cards from (ekCardIndex+1) to end, plus the EK
+    const subDeck = crypto.buildSubDeck(
+      this.currentDeck,
+      ekCardIndex + 1,
+      this.state.deckSize,
+      ekCardBytes,
+    );
+
+    // Submit reshuffle initiation
+    await chain.initiateReshuffle(
+      this.api,
+      this.players[0].account.signer,
+      this.gameId,
+      ekCardIndex,
+      subDeck.serialize(),
+    );
+
+    // All players shuffle the sub-deck
+    for (const player of this.players) {
+      if (this.stopped) return;
+      this.log("reshuffling", `${player.account.name} reshuffling...`);
+
+      const deckRaw = await chain.readReshuffleDeck(this.api, this.gameId);
+      if (!deckRaw) throw new Error("ReshuffleDeck missing");
+      const currentSubDeck = crypto.deckFromBytes(deckRaw);
+
+      const shuffleMsgBytes = this.aggKeys.shuffle_and_remask(player.keypair, currentSubDeck);
+
+      await chain.submitShuffle(
+        this.api,
+        player.account.signer,
+        this.gameId,
+        shuffleMsgBytes,
+      );
+      this.log("reshuffling", `${player.account.name} reshuffle verified.`);
+      await this.delay();
+    }
+
+    // Read the updated full deck from chain (pallet merged the sub-deck back)
+    const finalDeckRaw = await chain.readCurrentDeck(this.api, this.gameId);
+    this.currentDeck = crypto.deckFromBytes(finalDeckRaw);
+
+    // Adjust game state: drawIndex goes back to ekCardIndex, deckSize may have changed
+    this.state = {
+      ...this.state,
+      drawIndex: ekCardIndex,
+      deckSize: this.currentDeck.len(),
+    };
+    this.updatePhase("playing");
+    this.log("playing", "Reshuffle complete. Resuming play.");
   }
 
   // --- Private reveal protocol ---
@@ -258,12 +330,12 @@ export class GameHarness {
     cardIndex: number,
     recipientIdx: number,
   ): Promise<number> {
-    const card = this.currentDeck.get_card(cardIndex);
-    const reveals = crypto.newReveals();
+    const cardBytes = this.currentDeck.get_card(cardIndex);
+    const reveals = this.aggKeys.accumulate_reveals(cardBytes);
 
     // All players generate reveal tokens
     for (let p = 0; p < this.players.length; p++) {
-      const revealMsg = card.prove_reveal(this.players[p].keypair);
+      const revealMsgBytes = reveals.prove_reveal(this.players[p].keypair);
 
       if (p !== recipientIdx) {
         // Submit to chain (other players)
@@ -272,15 +344,15 @@ export class GameHarness {
           this.players[p].account.signer,
           this.gameId,
           cardIndex,
-          revealMsg.to_bytes(),
+          revealMsgBytes,
         );
       }
       // Collect all messages (including recipient's local one)
-      reveals.add(revealMsg);
+      reveals.add_reveal(revealMsgBytes);
     }
 
     // Recipient unmasks
-    return reveals.unmask(card);
+    return reveals.completed_position();
   }
 
   // --- Helpers ---

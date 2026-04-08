@@ -47,6 +47,7 @@ export type GamePhase =
   | "shuffling"
   | "dealing"
   | "playing"
+  | "reshuffling"
   | "finished";
 
 export interface LogEntry {

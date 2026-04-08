@@ -11,10 +11,9 @@ import type { TypedApi } from "./chain";
 import * as chain from "./chain";
 import * as crypto from "./crypto";
 import type {
-  PlayerData,
   PlayerKeypair,
-  MaskedDeck,
-  AggregatedKeys,
+  MaskedCards,
+  AggregatedPublicKeys,
 } from "./crypto";
 import type { DevAccount } from "./accounts";
 import {
@@ -43,8 +42,8 @@ export class PlayerAgent {
   private account: DevAccount;
   private onUpdate: (state: GameState) => void;
 
-  private playerData!: PlayerData;
   private keypair!: PlayerKeypair;
+  private helloBytes!: Uint8Array;
   private myIndex = -1;
   private playerAddresses: string[] = [];
 
@@ -52,8 +51,8 @@ export class PlayerAgent {
   private numPlayers = 0;
   private deckSize = 0;
   private state!: GameState;
-  private currentDeck!: MaskedDeck;
-  private aggKeys!: AggregatedKeys;
+  private currentDeck!: MaskedCards;
+  private aggKeys!: AggregatedPublicKeys;
   private signal = { stopped: false };
 
   constructor(config: AgentConfig) {
@@ -81,8 +80,7 @@ export class PlayerAgent {
     // Register ourselves
     this.updatePhase("registering");
     this.log("registering", `Registering ${this.account.name}...`);
-    const helloBytes = this.playerData.hello().to_bytes();
-    await chain.registerPlayer(this.api, this.account.signer, this.gameId, helloBytes);
+    await chain.registerPlayer(this.api, this.account.signer, this.gameId, this.helloBytes);
     this.log("registering", `${this.account.name} registered. Waiting for other players...`);
 
     // Continue protocol in background
@@ -106,8 +104,7 @@ export class PlayerAgent {
     // Register
     this.updatePhase("registering");
     this.log("registering", `Registering ${this.account.name}...`);
-    const helloBytes = this.playerData.hello().to_bytes();
-    await chain.registerPlayer(this.api, this.account.signer, this.gameId, helloBytes);
+    await chain.registerPlayer(this.api, this.account.signer, this.gameId, this.helloBytes);
     this.log("registering", `${this.account.name} registered. Waiting for other players...`);
 
     // Continue protocol in background
@@ -143,8 +140,9 @@ export class PlayerAgent {
     await crypto.initCrypto();
 
     this.log("setup", `Generating keys for ${this.account.name}...`);
-    this.playerData = crypto.generatePlayer(this.account.publicKey);
-    this.keypair = this.playerData.keypair();
+    const generated = crypto.generatePlayer(this.account.publicKey);
+    this.keypair = generated.keypair;
+    this.helloBytes = generated.helloBytes;
   }
 
   // --- Wait for all players to register ---
@@ -188,7 +186,7 @@ export class PlayerAgent {
         this.api,
         this.account.signer,
         this.gameId,
-        this.currentDeck.to_bytes(),
+        this.currentDeck.serialize(),
       );
       this.log("masking", "Deck masked and submitted.");
     } else {
@@ -222,14 +220,14 @@ export class PlayerAgent {
         const deckRaw = await chain.readCurrentDeck(this.api, this.gameId);
         this.currentDeck = crypto.deckFromBytes(deckRaw);
 
-        const shuffleMsg = this.aggKeys.shuffle(this.currentDeck);
+        const shuffleMsgBytes = this.aggKeys.shuffle_and_remask(this.keypair, this.currentDeck);
 
         this.log("shuffling", `${this.account.name} submitting shuffle proof...`);
         await chain.submitShuffle(
           this.api,
           this.account.signer,
           this.gameId,
-          shuffleMsg.to_bytes(),
+          shuffleMsgBytes,
         );
         this.log("shuffling", `${this.account.name} shuffle verified.`);
       } else {
@@ -284,14 +282,32 @@ export class PlayerAgent {
 
       if (playerIdx === this.myIndex) {
         this.log("playing", "Your turn — drawing a card...");
+        const hadDefuse = this.state.players[playerIdx].hand.some((c) => c.type === "defuse");
         const position = await this.revealToSelf(cardIndex);
+        const drawnType = crypto.cardType(position, this.state.numPlayers);
+
         this.state = processDrawnCard(this.state, playerIdx, position);
+        this.emitUpdate();
+
+        // If we drew an EK and defused it, initiate reshuffle
+        if (drawnType === "ek" && hadDefuse && !this.signal.stopped) {
+          await this.initiateReshuffle(cardIndex);
+          await this.participateInReshuffle();
+        }
       } else {
         this.log("playing", `${player.name}'s turn — drawing a card...`);
         await this.revealForOther(cardIndex);
-        // We don't know what they drew — mark as hidden
-        // TODO: detect if they died (requires checking if they act next turn)
-        this.state = processHiddenDraw(this.state, playerIdx, false);
+
+        // Check if the game entered Reshuffling (opponent defused an EK)
+        const info = await chain.readGameInfo(this.api, this.gameId);
+        if (info && info.phase === "Reshuffling") {
+          this.state = processHiddenDraw(this.state, playerIdx, false);
+          this.log("reshuffling", `${player.name} defused an Exploding Kitten! Reshuffling...`);
+          this.emitUpdate();
+          await this.participateInReshuffle();
+        } else {
+          this.state = processHiddenDraw(this.state, playerIdx, false);
+        }
       }
       this.emitUpdate();
 
@@ -306,6 +322,72 @@ export class PlayerAgent {
     }
   }
 
+  /** Initiate a reshuffle after we defuse an EK. */
+  private async initiateReshuffle(ekCardIndex: number): Promise<void> {
+    this.log("reshuffling", "Defused! Initiating reshuffle...");
+    this.updatePhase("reshuffling");
+
+    const ekCardBytes = new Uint8Array(this.currentDeck.get_card(ekCardIndex));
+    const subDeck = crypto.buildSubDeck(
+      this.currentDeck,
+      ekCardIndex + 1,
+      this.state.deckSize,
+      ekCardBytes,
+    );
+
+    await chain.initiateReshuffle(
+      this.api,
+      this.account.signer,
+      this.gameId,
+      ekCardIndex,
+      subDeck.serialize(),
+    );
+  }
+
+  /** Participate in a reshuffle round (all players must shuffle the sub-deck). */
+  private async participateInReshuffle(): Promise<void> {
+    this.updatePhase("reshuffling");
+
+    // Read the reshuffle start index for later
+    const fromIndex = await chain.readReshuffleFromIndex(this.api, this.gameId);
+
+    for (let i = 0; i < this.numPlayers; i++) {
+      if (this.signal.stopped) return;
+
+      if (i === this.myIndex) {
+        await chain.waitForShuffleIndex(this.api, this.gameId, i, this.signal);
+
+        const deckRaw = await chain.readReshuffleDeck(this.api, this.gameId);
+        if (!deckRaw) throw new Error("ReshuffleDeck missing");
+        const subDeck = crypto.deckFromBytes(deckRaw);
+
+        const shuffleMsgBytes = this.aggKeys.shuffle_and_remask(this.keypair, subDeck);
+        await chain.submitShuffle(
+          this.api, this.account.signer, this.gameId, shuffleMsgBytes,
+        );
+        this.log("reshuffling", `${this.account.name} reshuffle verified.`);
+      } else {
+        await chain.waitForShuffleIndex(this.api, this.gameId, i + 1, this.signal);
+      }
+    }
+
+    // Wait for game to return to Playing
+    await chain.waitForPhase(this.api, this.gameId, "Playing", this.signal);
+
+    // Refresh the deck
+    const finalDeckRaw = await chain.readCurrentDeck(this.api, this.gameId);
+    this.currentDeck = crypto.deckFromBytes(finalDeckRaw);
+
+    // Adjust drawIndex
+    this.state = {
+      ...this.state,
+      drawIndex: fromIndex ?? this.state.drawIndex,
+      deckSize: this.currentDeck.len(),
+    };
+    this.updatePhase("playing");
+    this.log("playing", "Reshuffle complete. Resuming play.");
+  }
+
   // --- Reveal protocol ---
 
   /**
@@ -316,16 +398,18 @@ export class PlayerAgent {
    * 4. Unmask locally
    */
   private async revealToSelf(cardIndex: number): Promise<number> {
-    const card = this.currentDeck.get_card(cardIndex);
+    const cardBytes = this.currentDeck.get_card(cardIndex);
+
+    const reveals = this.aggKeys.accumulate_reveals(cardBytes);
 
     // Submit our reveal token
-    const myRevealMsg = card.prove_reveal(this.keypair);
+    const myRevealMsgBytes = reveals.prove_reveal(this.keypair);
     await chain.submitReveal(
       this.api,
       this.account.signer,
       this.gameId,
       cardIndex,
-      myRevealMsg.to_bytes(),
+      myRevealMsgBytes,
     );
 
     // Wait for all N reveal tokens
@@ -338,8 +422,7 @@ export class PlayerAgent {
     );
 
     // Read all tokens and unmask
-    const reveals = crypto.newReveals();
-    reveals.add(myRevealMsg);
+    reveals.add_reveal(myRevealMsgBytes);
 
     for (let p = 0; p < this.playerAddresses.length; p++) {
       if (p === this.myIndex) continue;
@@ -350,10 +433,10 @@ export class PlayerAgent {
         this.playerAddresses[p],
       );
       if (!tokenBytes) throw new Error(`Missing reveal token from player ${p}`);
-      reveals.add(crypto.revealFromBytes(tokenBytes));
+      reveals.add_reveal(tokenBytes);
     }
 
-    return reveals.unmask(card);
+    return reveals.completed_position();
   }
 
   /**
@@ -361,15 +444,16 @@ export class PlayerAgent {
    * then wait for all reveals to complete.
    */
   private async revealForOther(cardIndex: number): Promise<void> {
-    const card = this.currentDeck.get_card(cardIndex);
-    const revealMsg = card.prove_reveal(this.keypair);
+    const cardBytes = this.currentDeck.get_card(cardIndex);
+    const reveals = this.aggKeys.accumulate_reveals(cardBytes);
+    const revealMsgBytes = reveals.prove_reveal(this.keypair);
 
     await chain.submitReveal(
       this.api,
       this.account.signer,
       this.gameId,
       cardIndex,
-      revealMsg.to_bytes(),
+      revealMsgBytes,
     );
 
     // Wait for all players to submit their reveals before moving on
@@ -401,4 +485,3 @@ export class PlayerAgent {
     this.onUpdate({ ...this.state });
   }
 }
-

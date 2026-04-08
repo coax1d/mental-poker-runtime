@@ -201,9 +201,39 @@ export async function readRevealCount(
   return (api as any).query.MentalPoker.RevealCount.getValue(gameId, cardIndex);
 }
 
+export async function initiateReshuffle(
+  api: Api,
+  signer: PolkadotSigner,
+  gameId: number,
+  fromCardIndex: number,
+  reshuffleDeckBytes: Uint8Array,
+): Promise<void> {
+  await (api as any).tx.MentalPoker.initiate_reshuffle({
+    game_id: gameId,
+    from_card_index: fromCardIndex,
+    reshuffle_deck_bytes: Binary.fromBytes(reshuffleDeckBytes),
+  }).signAndSubmit(signer);
+}
+
+export async function readReshuffleDeck(
+  api: Api,
+  gameId: number,
+): Promise<Uint8Array | undefined> {
+  const raw = await (api as any).query.MentalPoker.ReshuffleDeck.getValue(gameId);
+  if (!raw) return undefined;
+  return (raw as Binary).asBytes();
+}
+
+export async function readReshuffleFromIndex(
+  api: Api,
+  gameId: number,
+): Promise<number | undefined> {
+  return (api as any).query.MentalPoker.ReshuffleFromIndex.getValue(gameId);
+}
+
 // --- Polling Helpers ---
 
-export type GamePhaseOnChain = "Registration" | "Masking" | "Shuffling" | "Playing" | "Complete";
+export type GamePhaseOnChain = "Registration" | "Masking" | "Shuffling" | "Playing" | "Reshuffling" | "Complete";
 
 /**
  * Poll until the on-chain game phase matches the expected value.
