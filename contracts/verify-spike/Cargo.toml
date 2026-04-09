@@ -1,0 +1,23 @@
+[package]
+name = "verify-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+rust-version = "1.84"
+
+# Independent workspace — not part of the main mental-poker-runtime workspace.
+[workspace]
+
+[[bin]]
+name = "contract"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[dependencies]
+polkavm-derive = { version = "0.31" }
+uapi = { package = "pallet-revive-uapi", version = "0.11", default-features = false }

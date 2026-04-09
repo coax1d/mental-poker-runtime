@@ -1,0 +1,4 @@
+node_modules/
+.papi/
+.env
+deployment.json
