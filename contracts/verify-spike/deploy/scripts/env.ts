@@ -12,7 +12,11 @@ export const CONTRACT_PVM = resolve(SPIKE_DIR, "contract.polkavm");
 export const DEPLOYMENT_JSON = resolve(DEPLOY_DIR, "deployment.json");
 export const ENV_FILE = resolve(DEPLOY_DIR, ".env");
 
-export const DEFAULT_WS = "wss://testnet-passet-hub.polkadot.io";
+// The "official" wss://testnet-passet-hub.polkadot.io endpoint is dead.
+// IBP serves the same chain (Paseo Asset Hub, which now hosts pallet-revive
+// for Polkadot Hub TestNet) and proved fastest in probing.
+// Override via PASSET_HUB_WS in .env if you need a different endpoint.
+export const DEFAULT_WS = "wss://sys.ibp.network/asset-hub-paseo";
 
 export function wsUrl(): string {
   return process.env.PASSET_HUB_WS ?? DEFAULT_WS;
