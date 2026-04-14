@@ -19,5 +19,8 @@ codegen-units = 1
 panic = "abort"
 
 [dependencies]
-polkavm-derive = { version = "0.31" }
+# Pinned to 0.30 to match what pallet-revive on Paseo Asset Hub uses.
+# polkavm-derive 0.31+ produces binaries the chain's pallet-revive rejects
+# as `CodeRejected`. The SDK in-tree fixtures also pin to 0.30.
+polkavm-derive = { version = "0.30" }
 uapi = { package = "pallet-revive-uapi", version = "0.11", default-features = false }
