@@ -1,14 +1,27 @@
-//! Hello-world PolkaVM contract for the verify-spike, now with S3 linkage.
+//! verify-spike: S4 runs `verify_player` on-chain.
 //!
 //! Exports:
-//!   - `deploy`: run once at instantiation, no-op for now.
-//!   - `call`: returns `(0xCAFEBABE << 32) | serialized_compressed_size(Parameters)`
-//!             packed into the low 64 bits of a 32-byte big-endian word.
+//!   - `deploy`: no-op.
+//!   - `call`: runs `Parameters::verify_player` against a caller-supplied
+//!     `PlayerHello` + player name. Returns a 32-byte status blob.
 //!
-//! The `cards_protocol::Parameters` reference is just enough to force the
-//! linker to pull in arkworks and the Barnett-Smart crates, so `cargo build`
-//! exercises the same dependency graph S4 will need and `polkatool stats`
-//! reports the real binary size.
+//! Input layout (big-endian where numeric):
+//!   [0..4]         hello_len: u32
+//!   [4..4+N]       hello_bytes: arkworks-compressed `PlayerHello<secp256k1::Projective>`
+//!   [4+N..]        player_name: raw bytes (whatever the pallet would pass
+//!                  as `player_public_info`; typically the encoded account id)
+//!
+//! Output layout:
+//!   [0..28]        zero padding (Solidity 32-byte word alignment)
+//!   [28]           status: 0 = OK, 1 = short input, 2 = bad hello bytes,
+//!                          3 = verify_player failed
+//!   [29]           reserved (0)
+//!   [30..32]       params_size_mod_u16 (for quick smoke-test visibility)
+//!
+//! We stick to a single-byte status because pallet-revive's `call` extrinsic
+//! doesn't surface return data in events — the signal we'll actually see is
+//! ExtrinsicSuccess vs. ContractTrapped. Returning nonzero status lets a
+//! future state_call consumer see the finer-grained reason.
 
 #![no_main]
 #![no_std]
@@ -69,46 +82,73 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 #[polkavm_derive::polkavm_export]
 pub extern "C" fn deploy() {}
 
+const STATUS_OK: u8 = 0;
+const STATUS_SHORT_INPUT: u8 = 1;
+const STATUS_BAD_HELLO: u8 = 2;
+const STATUS_VERIFY_FAILED: u8 = 3;
+
+fn write_output(status: u8, params_size: usize) -> ! {
+    let mut output = [0u8; 32];
+    output[28] = status;
+    let tag = (params_size as u16).to_be_bytes();
+    output[30] = tag[0];
+    output[31] = tag[1];
+    // STATUS_OK returns normally → the extrinsic shows ExtrinsicSuccess on
+    // chain. Anything else reverts, so a failed verification surfaces as
+    // ExtrinsicFailed(ContractReverted) without needing state_call to
+    // inspect the status byte.
+    let flags = if status == STATUS_OK {
+        ReturnFlags::empty()
+    } else {
+        ReturnFlags::REVERT
+    };
+    api::return_value(flags, &output);
+}
+
 #[no_mangle]
 #[polkavm_derive::polkavm_export]
 pub extern "C" fn call() {
     use alloc::vec::Vec;
     use ark_serialize::CanonicalDeserialize;
+    use cards_protocol::keys::PlayerHello;
 
-    // Read input length from the runtime so we force real work — without this
-    // the compiler constant-folds the whole call and prunes arkworks.
     let input_len = api::call_data_size() as usize;
 
-    // Actually serialize PARAMS — this writes to memory at runtime, so LLVM
-    // can't pre-compute it.
-    let mut buf: Vec<u8> = Vec::new();
-    deck_secp256k1::PARAMS
-        .serialize_compressed(&mut buf)
-        .ok();
+    // Read the whole call data into a heap buffer. Keeping it on the heap
+    // (not a fixed-size stack array) avoids blowing polkavm's static stack
+    // budget for realistic `PlayerHello` payloads (~200 bytes).
+    let mut input: Vec<u8> = alloc::vec![0u8; input_len];
+    if input_len > 0 {
+        api::call_data_copy(&mut input, 0);
+    }
 
-    // If the caller sent any input, try to deserialize it as a curve point
-    // (mirrors the hot path in verify_player). This pulls arkworks curve
-    // deserialization into the linked image.
-    let deser_ok: u32 = if input_len > 0 {
-        let mut input = [0u8; 33]; // secp256k1 compressed point is 33 bytes
-        let take = core::cmp::min(input_len, input.len()) as u32;
-        api::call_data_copy(&mut input[..take as usize], 0);
-        match ark_secp256k1::Affine::deserialize_compressed(&input[..take as usize]) {
-            Ok(_) => 1,
-            Err(_) => 0,
-        }
-    } else {
-        0
+    // Pre-compute the params size for the output tag — also the hook that
+    // keeps arkworks in the linked image even when the caller sends no data.
+    let params = deck_secp256k1::PARAMS;
+    let params_size = params.serialized_size(ark_serialize::Compress::Yes);
+
+    // Parse the input envelope: u32 hello_len | hello | name.
+    if input_len < 4 {
+        write_output(STATUS_SHORT_INPUT, params_size);
+    }
+    let hello_len = u32::from_be_bytes([input[0], input[1], input[2], input[3]]) as usize;
+    if input_len < 4 + hello_len {
+        write_output(STATUS_SHORT_INPUT, params_size);
+    }
+    let hello_bytes = &input[4..4 + hello_len];
+    let name_bytes = &input[4 + hello_len..];
+
+    let hello = match PlayerHello::<ark_secp256k1::Projective>::deserialize_compressed(
+        hello_bytes,
+    ) {
+        Ok(h) => h,
+        Err(_) => write_output(STATUS_BAD_HELLO, params_size),
     };
 
-    // Pack 0xCAFEBABE | serialized_len | deser_ok into an output blob.
-    let serialized_len = buf.len() as u32;
-    let sentinel = 0xCAFE_BABE_u32;
-
-    let mut output = [0u8; 32];
-    output[16..20].copy_from_slice(&sentinel.to_be_bytes());
-    output[20..24].copy_from_slice(&serialized_len.to_be_bytes());
-    output[24..28].copy_from_slice(&deser_ok.to_be_bytes());
-    output[28..32].copy_from_slice(&(input_len as u32).to_be_bytes());
-    api::return_value(ReturnFlags::empty(), &output);
+    // The real verification: ownership proof over the player's public key,
+    // bound to `name_bytes` through the Fiat-Shamir transcript.
+    match params.verify_player(&hello, name_bytes) {
+        Ok(_) => write_output(STATUS_OK, params_size),
+        Err(_) => write_output(STATUS_VERIFY_FAILED, params_size),
+    }
 }

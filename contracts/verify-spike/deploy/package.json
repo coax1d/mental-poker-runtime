@@ -9,7 +9,8 @@
     "papi:update": "papi",
     "gen-account": "tsx scripts/gen-account.ts",
     "deploy": "tsx scripts/deploy.ts",
-    "call": "tsx scripts/call.ts"
+    "call": "tsx scripts/call.ts",
+    "verify": "tsx scripts/verify.ts"
   },
   "dependencies": {
     "@polkadot-api/descriptors": "file:.papi/descriptors",
