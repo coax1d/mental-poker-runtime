@@ -10,7 +10,8 @@
     "gen-account": "tsx scripts/gen-account.ts",
     "deploy": "tsx scripts/deploy.ts",
     "call": "tsx scripts/call.ts",
-    "verify": "tsx scripts/verify.ts"
+    "verify": "tsx scripts/verify.ts",
+    "verify-shuffle": "tsx scripts/verify-shuffle.ts"
   },
   "dependencies": {
     "@polkadot-api/descriptors": "file:.papi/descriptors",
