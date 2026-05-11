@@ -2,7 +2,7 @@
 
 ## The Problem
 
-The Bayer-Groth shuffle proof verifier may exceed the block weight limit on Polkadot Asset Hub (pallet-revive). This document explains why at the cryptographic level and what the numbers look like.
+The Bayer-Groth shuffle proof verifier may exceed the block weight limit on Polkadot Asset Hub (pallet-revive). The bottleneck is **CPU time**, not data size — the proof itself is compact (~7.7 KB for 52 cards), but the verifier must perform hundreds of elliptic curve operations internally.
 
 ## Block Weight Budget
 
@@ -15,26 +15,41 @@ The Bayer-Groth shuffle proof verifier may exceed the block weight limit on Polk
 
 A single contract call on Polkadot Hub has at most ~1.3-1.5 seconds of CPU time available. There is no mechanism for a contract call to span multiple blocks.
 
+## Proof Size vs Verification Cost — The Key Distinction
+
+Bayer-Groth is designed to be **communication-efficient**: the proof is sub-linear in deck size. For a 52-card deck, the entire `ShuffleMessage` serializes to only **7,710 bytes**:
+
+| Component | Size |
+|-----------|------|
+| Shuffled deck (52 × 66 bytes) | 3,432 bytes |
+| Bayer-Groth ZK proof | ~4,148 bytes |
+| Player public key + ownership sig | ~130 bytes |
+| **Total ShuffleMessage** | **~7,710 bytes** |
+
+The pallet's `MAX_SHUFFLE_SIZE = 262,144` (256 KB) is a generous upper bound for very large decks (up to 200 cards). For our 52-card Exploding Kittens demo, the data is small.
+
+**The expense comes from what the verifier must compute, not how much data it receives.** A small, elegant proof can still require expensive verification — that's the fundamental tradeoff in zero-knowledge proof systems (compact proofs often shift work to the verifier).
+
 ## What Bayer-Groth Shuffle Verification Actually Does
 
-The verifier proves that an encrypted deck was correctly permuted and re-encrypted (re-masked) without revealing the permutation. It runs **three nested zero-knowledge arguments**:
+The verifier confirms that an encrypted deck was correctly permuted and re-encrypted (re-masked) without revealing the permutation. It runs **three nested zero-knowledge arguments**:
 
 ### 1. Multi-Exponentiation Argument (the bottleneck)
 
-For a 52-card deck arranged as an m x n matrix (e.g. 4 x 13), the verifier runs a **diagonal computation** that is O(m^2) in ciphertext operations. Each ciphertext operation involves 2 elliptic curve point multiplications on secp256k1.
+For a 52-card deck arranged as an m × n matrix (m=4, n=13 via `mid_factor(52)`), the verifier runs a **diagonal computation** that is O(m²) in ciphertext operations. Each ciphertext operation involves 2 elliptic curve scalar multiplications on secp256k1.
 
 ```
 for each of m rows:
     multiply m scalars by a challenge power       (m scalar mults)
     dot-product with m ciphertexts                (m EC point additions)
-= m * (m scalar mults + m point additions) = O(m^2) group operations
+= m × (m scalar mults + m point additions) = O(m²) group operations
 ```
 
 For 52 cards (m=4, n=13): ~200+ group operations in this step alone.
 
 ### 2. Matrix Elements Product Argument
 
-Verifies the permutation is valid via a Hadamard product check. Involves O(m*n) group element additions, plus a nested **zero-value bilinear map** sub-argument with its own commitment checks and field operations.
+Verifies the permutation is valid via a Hadamard product check. Involves O(m·n) group element additions, plus a nested **zero-value bilinear map** sub-argument with its own commitment checks and field operations.
 
 ### 3. Pedersen Commitment Verification
 
@@ -51,18 +66,19 @@ Multiple multi-scalar multiplications (MSMs) via `msm_unchecked()` over n bases.
 - Three nested proof protocols, each with their own challenge-response verification
 - All operating on El Gamal ciphertexts (2 EC points each, doubling the work)
 
-## Why the Shuffle Message Is ~256 KB
+The proof's small wire size (~7.7 KB) is deceptive — it encodes commitments and blinded values that the verifier must expand back into full verification equations over the entire m×n matrix of ciphertexts.
 
-The `ShuffleMessage` contains:
-- **Shuffled deck**: 52 cards x ~66 bytes each (two compressed secp256k1 points per El Gamal ciphertext) = ~3.4 KB
-- **Shuffle proof** (`ShuffleUnsigned.proof`):
-  - m + n Pedersen commitments (~33 bytes each)
-  - m + 1 ciphertexts in the multi-exponentiation proof (~66 bytes each)
-  - n blinded scalars (~32 bytes each)
-  - Nested sub-proofs (product argument, Hadamard, zero-value bilinear map)
-- **Player public key + key ownership signature**: ~130 bytes
+## How Proof Size and Verification Cost Scale with Deck Size
 
-Total scales as O(m + n) for proof elements plus O(m*n) for the deck, reaching tens of KB for a 52-card deck.
+| Deck Size | Matrix (m×n) | Proof Size (approx) | Verification Cost |
+|-----------|-------------|---------------------|-------------------|
+| 8 cards | 2×4 | ~2 KB | Baseline |
+| 52 cards | 4×13 | ~7.7 KB | ~16x baseline (m²=16) |
+| 100 cards | 10×10 | ~15 KB | ~100x baseline (m²=100) |
+| 200 cards | 10×20 | ~30 KB | ~100x baseline |
+
+Proof size grows as O(m + n) — sub-linear and compact.
+Verification cost grows as O(m²) — the expensive diagonal computation dominates.
 
 ## Comparison: How Others Solved This
 

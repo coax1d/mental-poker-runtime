@@ -42,7 +42,7 @@ use uapi::{HostFn, HostFnImpl as api, ReturnFlags};
 // ---------------------------------------------------------------------------
 // Bump allocator — same as S4 but sized up for verify_shuffle intermediates.
 // ---------------------------------------------------------------------------
-const HEAP_SIZE: usize = 4 * 1024 * 1024; // 4 MB
+const HEAP_SIZE: usize = 1536 * 1024; // 1.5 MB
 #[repr(align(16))]
 struct Heap(UnsafeCell<[u8; HEAP_SIZE]>);
 unsafe impl Sync for Heap {}

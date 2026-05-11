@@ -47,7 +47,7 @@ const callArgs = {
   value: 0n,
   // S7: request the maximum weight we can — up to the full normal dispatch
   // budget (75% of 2s block = 1.5s). The chain will charge actual consumption.
-  weight_limit: { ref_time: 1_500_000_000_000n, proof_size: 50_000_000n },
+  weight_limit: { ref_time: 1_200_000_000_000n, proof_size: 5_000_000n },
   storage_deposit_limit: 10_000_000_000_000n,
   data: Binary.fromBytes(input),
 };
