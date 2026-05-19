@@ -1,0 +1,25 @@
+{
+  "name": "mental-poker-deploy",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Deploy/call scripts for the mental-poker contract on Paseo Asset Hub.",
+  "scripts": {
+    "papi:add": "papi add passet -w wss://sys.ibp.network/asset-hub-paseo",
+    "papi:update": "papi",
+    "deploy": "tsx scripts/deploy.ts",
+    "test-flow": "tsx scripts/test-flow.ts"
+  },
+  "dependencies": {
+    "@polkadot-api/descriptors": "file:.papi/descriptors",
+    "@polkadot-labs/hdkd": "^0.0.11",
+    "@polkadot-labs/hdkd-helpers": "^0.0.13",
+    "dotenv": "^16.4.5",
+    "polkadot-api": "^1.23.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

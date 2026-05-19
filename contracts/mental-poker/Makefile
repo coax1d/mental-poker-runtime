@@ -1,4 +1,4 @@
-TARGETS = all clean stats disasm linker
+TARGETS = all clean stats disasm linker gen-test-flow
 .PHONY: $(TARGETS)
 .SILENT: $(TARGETS)
 
@@ -6,6 +6,7 @@ CONTRACT_ELF := target/riscv64emac-unknown-none-polkavm/release/contract
 CONTRACT_PVM := contract.polkavm
 HOST_TRIPLE := $(shell rustc -vV | awk '/^host:/ { print $$2 }')
 LINKER_BIN := linker/target/$(HOST_TRIPLE)/release/revive-linker
+GEN_TEST_FLOW_BIN := gen-test-flow/target/$(HOST_TRIPLE)/release/gen-test-flow
 
 all: linker
 	RUSTC_BOOTSTRAP=1 \
@@ -16,6 +17,10 @@ all: linker
 
 linker:
 	cargo build --release --manifest-path linker/Cargo.toml --target $(HOST_TRIPLE)
+
+gen-test-flow:
+	cargo build --release --manifest-path gen-test-flow/Cargo.toml --target $(HOST_TRIPLE)
+	@echo "Built: $(GEN_TEST_FLOW_BIN)"
 
 stats:
 	polkatool stats $(CONTRACT_PVM)
