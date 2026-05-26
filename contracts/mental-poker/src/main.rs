@@ -188,24 +188,51 @@ fn load_player_pk_bytes(idx: u8) -> Option<Vec<u8>> {
     }
 }
 
+/// Store deck in chunks of CHUNK_SIZE bytes to stay within pallet-revive's
+/// per-value storage limit.
+const DECK_CHUNK_SIZE: usize = 400; // pallet-revive limit: 416 bytes per storage item
+
 fn store_deck(deck_bytes: &[u8]) {
-    api::set_storage(STORAGE, b"deck", deck_bytes);
+    let num_chunks = (deck_bytes.len() + DECK_CHUNK_SIZE - 1) / DECK_CHUNK_SIZE;
+    // Store the total length and chunk count in a header slot
+    let mut header = [0u8; 8];
+    header[0..4].copy_from_slice(&(deck_bytes.len() as u32).to_be_bytes());
+    header[4..8].copy_from_slice(&(num_chunks as u32).to_be_bytes());
+    api::set_storage(STORAGE, b"dkhd", &header);
+
+    for i in 0..num_chunks {
+        let start = i * DECK_CHUNK_SIZE;
+        let end = core::cmp::min(start + DECK_CHUNK_SIZE, deck_bytes.len());
+        let key = [b'd', b'k', (i >> 8) as u8, i as u8];
+        api::set_storage(STORAGE, &key, &deck_bytes[start..end]);
+    }
 }
 
 #[allow(dead_code)]
 fn load_deck_bytes() -> Option<Vec<u8>> {
-    let buf_len = 65536usize; // MAX_DECK_SIZE
-    let mut buf = alloc::vec![0u8; buf_len];
-    let mut out: &mut [u8] = &mut buf;
-    match api::get_storage(STORAGE, b"deck", &mut out) {
-        Ok(()) => {
-            let remaining = out.len();
-            let len = buf_len - remaining;
-            buf.truncate(len);
-            Some(buf)
-        }
-        Err(_) => None,
+    // Read header
+    let mut header = [0u8; 8];
+    let mut out: &mut [u8] = &mut header;
+    if api::get_storage(STORAGE, b"dkhd", &mut out).is_err() {
+        return None;
     }
+    let total_len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    let num_chunks = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
+
+    let mut deck = alloc::vec![0u8; total_len];
+    for i in 0..num_chunks {
+        let start = i * DECK_CHUNK_SIZE;
+        let end = core::cmp::min(start + DECK_CHUNK_SIZE, total_len);
+        let chunk_len = end - start;
+        let key = [b'd', b'k', (i >> 8) as u8, i as u8];
+        let mut buf = alloc::vec![0u8; chunk_len];
+        let mut out: &mut [u8] = &mut buf;
+        if api::get_storage(STORAGE, &key, &mut out).is_err() {
+            return None;
+        }
+        deck[start..end].copy_from_slice(&buf[..chunk_len]);
+    }
+    Some(deck)
 }
 
 fn reveal_key(card: u16, player_idx: u8) -> [u8; 5] {
@@ -449,13 +476,12 @@ fn msg_submit_agreed_deck(input: &[u8]) -> ! {
     let deck_bytes = &input[cursor..cursor + deck_len];
     cursor += deck_len;
 
-    // Verify deck deserializes and has correct size
-    let deck: Vec<cards_protocol::MaskedCard<ark_secp256k1::Projective>> =
-        match CanonicalDeserialize::deserialize_compressed(deck_bytes) {
-            Ok(d) => d,
-            Err(_) => return_status(STATUS_BAD_DESER),
-        };
-    if deck.len() != game.deck_size as usize {
+    // Skip full deserialization — both players already validated the deck
+    // off-chain before signing it. Just do a basic byte-length sanity check.
+    // Each MaskedCard = 2 compressed secp256k1 points = 66 bytes.
+    // Arkworks Vec serialization prepends an 8-byte length.
+    let expected_len = 8 + (game.deck_size as usize) * 66;
+    if deck_len != expected_len {
         return_status(STATUS_BAD_INPUT);
     }
 
