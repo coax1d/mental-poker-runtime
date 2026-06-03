@@ -8,7 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "build:wasm": "wasm-pack build ../../mental-poker/play --target web --features wasm && rm -rf src/wasm/pkg && cp -r ../../mental-poker/play/pkg src/wasm/pkg",
-    "setup:papi": "papi add passet -f ../contracts/verify-spike/passet.metadata.scale",
+    "setup:papi": "papi add passet -w wss://sys.ibp.network/asset-hub-paseo",
     "setup": "npm run build:wasm && npm run setup:papi"
   },
   "dependencies": {
