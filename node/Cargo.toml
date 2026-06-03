@@ -15,7 +15,7 @@ futures-timer = { workspace = true }
 jsonrpsee = { features = ["server"], workspace = true }
 
 mental-poker-runtime = { workspace = true }
-polkadot-sdk = { workspace = true, features = ["experimental", "node"] }
+polkadot-sdk = { workspace = true, features = ["experimental", "node", "runtime"] }
 
 [build-dependencies]
 polkadot-sdk = { workspace = true, features = ["substrate-build-script-utils"] }

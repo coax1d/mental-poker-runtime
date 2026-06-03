@@ -100,6 +100,15 @@ pub mod pallet {
 	pub type RevealCount<T> =
 		StorageDoubleMap<_, Blake2_128Concat, u32, Blake2_128Concat, u32, u32, ValueQuery>;
 
+	/// Sub-deck being reshuffled (separate from CurrentDeck during reshuffle).
+	#[pallet::storage]
+	pub type ReshuffleDeck<T> = StorageMap<_, Blake2_128Concat, u32, BoundedVec<u8, MaxDeckSize>>;
+
+	/// The card index from which the reshuffle sub-deck starts.
+	/// After reshuffle, CurrentDeck is truncated to this index and the reshuffled sub-deck is appended.
+	#[pallet::storage]
+	pub type ReshuffleFromIndex<T> = StorageMap<_, Blake2_128Concat, u32, u32>;
+
 	// ---- EVENTS ----
 
 	#[pallet::event]
@@ -113,6 +122,8 @@ pub mod pallet {
 		ShuffleComplete { game_id: u32 },
 		RevealTokenSubmitted { game_id: u32, card_index: u32, player: T::AccountId },
 		CardRevealed { game_id: u32, card_index: u32 },
+		ReshuffleInitiated { game_id: u32, from_card_index: u32, sub_deck_size: u32 },
+		ReshuffleComplete { game_id: u32, new_deck_size: u32 },
 	}
 
 	// ---- ERRORS ----
@@ -271,6 +282,7 @@ pub mod pallet {
 		/// Submit a shuffled deck with its ZK proof.
 		///
 		/// Must be called by players in order (according to PlayerOrder).
+		/// Works for both the initial Shuffling phase and mid-game Reshuffling.
 		/// `shuffle_msg_bytes` is the serialized `ShuffleMessage<Curve>`.
 		#[pallet::call_index(3)]
 		#[pallet::weight(Weight::from_parts(50_000_000, 0))]
@@ -282,7 +294,11 @@ pub mod pallet {
 			let who = ensure_signed(origin)?;
 
 			let mut game = Games::<T>::get(game_id).ok_or(Error::<T>::GameNotFound)?;
-			ensure!(game.phase == GamePhase::Shuffling, Error::<T>::GameNotInPhase);
+			let is_reshuffle = match game.phase {
+				GamePhase::Shuffling => false,
+				GamePhase::Reshuffling => true,
+				_ => return Err(Error::<T>::GameNotInPhase.into()),
+			};
 
 			// Verify it's this player's turn
 			let players = PlayerOrder::<T>::get(game_id).ok_or(Error::<T>::GameNotFound)?;
@@ -296,8 +312,12 @@ pub mod pallet {
 			let shuffle_msg: ShuffleMessage =
 				deserialize_ark(&shuffle_msg_bytes).map_err(|_| Error::<T>::DeserializationFailed)?;
 
-			// Load current deck
-			let deck_bytes = CurrentDeck::<T>::get(game_id).ok_or(Error::<T>::GameNotFound)?;
+			// Load the deck being shuffled (CurrentDeck or ReshuffleDeck)
+			let deck_bytes = if is_reshuffle {
+				ReshuffleDeck::<T>::get(game_id).ok_or(Error::<T>::GameNotFound)?
+			} else {
+				CurrentDeck::<T>::get(game_id).ok_or(Error::<T>::GameNotFound)?
+			};
 			let current_deck: Vec<MaskedCard> =
 				deserialize_ark(&deck_bytes).map_err(|_| Error::<T>::DeserializationFailed)?;
 
@@ -306,26 +326,64 @@ pub mod pallet {
 			let params = Self::load_parameters(game.deck_size)?;
 			let apk = Self::reconstruct_apk(game_id, &params, &apk_bytes)?;
 
-			apk.verify_shuffle(&current_deck, &shuffle_msg)
+			let (_pk, shuffled_deck) = apk.verify_shuffle(&current_deck, &shuffle_msg)
 				.map_err(|_| Error::<T>::InvalidProof)?;
 
-			// Update deck with the new shuffled deck
 			let new_deck_bytes: BoundedVec<u8, MaxDeckSize> =
-				serialize_ark(&shuffle_msg.deck)
+				serialize_ark(shuffled_deck)
 					.try_into()
 					.map_err(|_| Error::<T>::DataTooLarge)?;
-			CurrentDeck::<T>::insert(game_id, new_deck_bytes);
+
+			if is_reshuffle {
+				ReshuffleDeck::<T>::insert(game_id, new_deck_bytes.clone());
+			} else {
+				CurrentDeck::<T>::insert(game_id, new_deck_bytes.clone());
+			}
 
 			let next_idx = shuffle_idx.saturating_add(1);
 			ShuffleIndex::<T>::insert(game_id, next_idx);
 
 			Self::deposit_event(Event::ShuffleSubmitted { game_id, player: who });
 
-			// If all players have shuffled, transition to Playing
+			// If all players have shuffled
 			if next_idx >= game.num_players {
-				game.phase = GamePhase::Playing;
-				Games::<T>::insert(game_id, game);
-				Self::deposit_event(Event::ShuffleComplete { game_id });
+				if is_reshuffle {
+					// Merge reshuffled sub-deck back into CurrentDeck
+					let from_idx = ReshuffleFromIndex::<T>::get(game_id)
+						.ok_or(Error::<T>::InternalError)?;
+					let main_deck_bytes = CurrentDeck::<T>::get(game_id)
+						.ok_or(Error::<T>::GameNotFound)?;
+					let mut main_deck: Vec<MaskedCard> =
+						deserialize_ark(&main_deck_bytes)
+							.map_err(|_| Error::<T>::DeserializationFailed)?;
+					let reshuffled: Vec<MaskedCard> =
+						deserialize_ark(&new_deck_bytes)
+							.map_err(|_| Error::<T>::DeserializationFailed)?;
+
+					main_deck.truncate(from_idx as usize);
+					main_deck.extend(reshuffled);
+
+					let combined_bytes: BoundedVec<u8, MaxDeckSize> =
+						serialize_ark(&main_deck)
+							.try_into()
+							.map_err(|_| Error::<T>::DataTooLarge)?;
+
+					let new_deck_size = main_deck.len() as u32;
+					CurrentDeck::<T>::insert(game_id, combined_bytes);
+					game.deck_size = new_deck_size;
+					game.phase = GamePhase::Playing;
+					Games::<T>::insert(game_id, game);
+
+					// Cleanup
+					ReshuffleDeck::<T>::remove(game_id);
+					ReshuffleFromIndex::<T>::remove(game_id);
+
+					Self::deposit_event(Event::ReshuffleComplete { game_id, new_deck_size });
+				} else {
+					game.phase = GamePhase::Playing;
+					Games::<T>::insert(game_id, game);
+					Self::deposit_event(Event::ShuffleComplete { game_id });
+				}
 			} else {
 				Games::<T>::insert(game_id, game);
 			}
@@ -392,6 +450,50 @@ pub mod pallet {
 
 			Ok(())
 		}
+
+		/// Initiate a mid-game reshuffle (e.g., after an Exploding Kitten is defused).
+		///
+		/// The caller submits a sub-deck (remaining undrawn cards + the card to re-insert)
+		/// and a `from_card_index` indicating where the sub-deck slots back into CurrentDeck.
+		/// All players must then submit shuffles for this sub-deck before play resumes.
+		#[pallet::call_index(5)]
+		#[pallet::weight(Weight::from_parts(2_000_000, 0))]
+		pub fn initiate_reshuffle(
+			origin: OriginFor<T>,
+			game_id: u32,
+			from_card_index: u32,
+			reshuffle_deck_bytes: BoundedVec<u8, MaxDeckSize>,
+		) -> DispatchResult {
+			let who = ensure_signed(origin)?;
+
+			let mut game = Games::<T>::get(game_id).ok_or(Error::<T>::GameNotFound)?;
+			ensure!(game.phase == GamePhase::Playing, Error::<T>::GameNotInPhase);
+
+			// Verify the player is part of the game
+			let players = PlayerOrder::<T>::get(game_id).ok_or(Error::<T>::GameNotFound)?;
+			ensure!(players.contains(&who), Error::<T>::InvalidProof);
+
+			// Validate the sub-deck can be deserialized
+			let sub_deck: Vec<MaskedCard> =
+				deserialize_ark(&reshuffle_deck_bytes).map_err(|_| Error::<T>::DeserializationFailed)?;
+			let sub_deck_size = sub_deck.len() as u32;
+
+			// Store reshuffle state
+			ReshuffleDeck::<T>::insert(game_id, reshuffle_deck_bytes);
+			ReshuffleFromIndex::<T>::insert(game_id, from_card_index);
+			ShuffleIndex::<T>::insert(game_id, 0u32);
+
+			game.phase = GamePhase::Reshuffling;
+			Games::<T>::insert(game_id, game);
+
+			Self::deposit_event(Event::ReshuffleInitiated {
+				game_id,
+				from_card_index,
+				sub_deck_size,
+			});
+
+			Ok(())
+		}
 	}
 
 	// ---- HELPERS ----
@@ -427,16 +529,9 @@ pub mod pallet {
 					.map_err(|_| Error::<T>::InvalidProof)?;
 			}
 
-			// Serialize the aggregate public key and player keys for later reconstruction
-			let agg_key = apk.aggregate_key();
-			let player_pks: Vec<PlayerPublicKey> = apk.players().to_vec();
-
-			// Store both aggregate key and individual public keys together
-			let mut agg_data = Vec::new();
-			ark_serialize::CanonicalSerialize::serialize_compressed(agg_key, &mut agg_data)
-				.map_err(|_| Error::<T>::InternalError)?;
-			ark_serialize::CanonicalSerialize::serialize_compressed(&player_pks, &mut agg_data)
-				.map_err(|_| Error::<T>::InternalError)?;
+			// Serialize using the AggregatedPublicKeys' own CanonicalSerialize impl,
+			// which writes Vec<PlayerPublicKey> (the aggregate key is re-derived on deser).
+			let agg_data = serialize_ark(&apk);
 
 			let bounded: BoundedVec<u8, MaxAggKeySize> =
 				agg_data.try_into().map_err(|_| Error::<T>::DataTooLarge)?;

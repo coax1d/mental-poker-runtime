@@ -19,6 +19,7 @@ pub enum GamePhase {
 	Masking,
 	Shuffling,
 	Playing,
+	Reshuffling,
 	Complete,
 }
 
@@ -30,7 +31,7 @@ pub struct GameInfo {
 	pub registered_count: u32,
 }
 
-pub fn serialize_ark<T: CanonicalSerialize>(val: &T) -> alloc::vec::Vec<u8> {
+pub fn serialize_ark<T: CanonicalSerialize + ?Sized>(val: &T) -> alloc::vec::Vec<u8> {
 	let mut bytes = alloc::vec::Vec::new();
 	val.serialize_compressed(&mut bytes).expect("serialization should not fail");
 	bytes
