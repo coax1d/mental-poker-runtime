@@ -39,14 +39,13 @@ Produces `contract.polkavm` (~75 KB).
 ```bash
 cd contracts/mental-poker/deploy
 npm install
-
-# Create .env with a funded SS58 mnemonic (see scripts/env.ts for the full var list):
-#   PASSET_HUB_MNEMONIC="<your 12-word phrase>"
-#   PASSET_HUB_ADDRESS="<corresponding SS58>"
+cp .env.example .env   # then edit .env with a funded SS58 mnemonic + address
 
 npm run papi:add       # fetch chain metadata (one-time)
 npm run deploy         # instantiate; writes deployment.json
 ```
+
+> **Need a fresh account?** Any SS58 wallet works (polkadot.js, Talisman, SubWallet — generate, then export the mnemonic into `.env`). Fund it from [faucet.polkadot.io](https://faucet.polkadot.io/) → *Polkadot Testnet (Paseo)* → *Hub (Contracts)*. The deploy script will auto-`map_account` it on first run.
 
 The deploy script handles `Revive.map_account` for you. Copy the printed contract address into `client/src/App.tsx` (`DEFAULT_CONTRACT`), or paste it into the UI's Contract Address field at runtime.
 
