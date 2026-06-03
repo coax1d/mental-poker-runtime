@@ -74,6 +74,7 @@ const PHASE_NONE: u8 = 0;
 const PHASE_REGISTRATION: u8 = 1;
 const PHASE_AWAITING_DECK: u8 = 2;
 const PHASE_PLAYING: u8 = 3;
+#[allow(dead_code)]
 const PHASE_COMPLETE: u8 = 4;
 const PHASE_CANCELLED: u8 = 5;
 
@@ -97,6 +98,7 @@ const STATUS_VERIFY_FAILED: u8 = 7;
 const STATUS_ALREADY_REVEALED: u8 = 8;
 const STATUS_CARD_OOB: u8 = 9;
 const STATUS_TIMEOUT_NOT_REACHED: u8 = 10;
+#[allow(dead_code)]
 const STATUS_GAME_EXISTS: u8 = 11;
 
 // ---------------------------------------------------------------------------
@@ -141,6 +143,47 @@ impl GameInfo {
 fn store_game(info: &GameInfo) {
     let b = info.to_bytes();
     api::set_storage(STORAGE, b"game", &b);
+}
+
+/// Soft-clear a storage entry by writing an empty value. uapi 0.11 does not
+/// expose pallet-revive's clear_storage host fn, but our loaders treat
+/// empty/zeroed reads as "no data", so this gives reset semantics.
+fn clear_at(key: &[u8]) {
+    api::set_storage(STORAGE, key, &[]);
+}
+
+/// Wipe per-player, deck, and reveal rows from a prior game so a fresh
+/// create_game starts from clean state.
+fn clear_prior_game(prior: &GameInfo) {
+    // Per-player rows
+    for p in 0..prior.num_players {
+        let plyr_key = [b'p', b'l', b'y', b'r', p];
+        clear_at(&plyr_key);
+        let pk_key = [b'p', b'k', p];
+        clear_at(&pk_key);
+    }
+    // Per-card reveal rows + counts
+    for card in 0..prior.deck_size {
+        let cb = card.to_be_bytes();
+        let rc_key = [b'r', b'c', cb[0], cb[1]];
+        clear_at(&rc_key);
+        for p in 0..prior.num_players {
+            let rv_key = [b'r', b'v', cb[0], cb[1], p];
+            clear_at(&rv_key);
+        }
+    }
+    // Deck chunks — read header to learn count, then clear each + header.
+    let mut header = [0u8; 8];
+    let mut out: &mut [u8] = &mut header;
+    if api::get_storage(STORAGE, b"dkhd", &mut out).is_ok() {
+        let num_chunks =
+            u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        for i in 0..num_chunks {
+            let key = [b'd', b'k', (i >> 8) as u8, i as u8];
+            clear_at(&key);
+        }
+        clear_at(b"dkhd");
+    }
 }
 
 fn load_game() -> Option<GameInfo> {
@@ -353,10 +396,12 @@ pub extern "C" fn call() {
 // 0x01: create_game(deck_size: u16 BE, num_players: u8, timeout_blocks: u32 BE)
 // ---------------------------------------------------------------------------
 fn msg_create_game(input: &[u8]) -> ! {
-    // Don't allow creating a game if one already exists
-    if let Some(g) = load_game() {
-        if g.phase != PHASE_NONE && g.phase != PHASE_COMPLETE && g.phase != PHASE_CANCELLED {
-            return_status(STATUS_GAME_EXISTS);
+    // Wipe stale rows from any prior game so create_game is idempotent.
+    // Removes the redeploy-per-game treadmill: a finished or stuck game on
+    // this contract instance no longer blocks starting a new one.
+    if let Some(prior) = load_game() {
+        if prior.phase != PHASE_NONE {
+            clear_prior_game(&prior);
         }
     }
 
