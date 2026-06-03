@@ -1,0 +1,35 @@
+[package]
+name = "mental-poker-contract"
+version = "0.1.0"
+edition = "2021"
+publish = false
+rust-version = "1.84"
+
+# Independent workspace — not part of the main mental-poker-runtime workspace.
+[workspace]
+
+[[bin]]
+name = "contract"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[dependencies]
+polkavm-derive = { version = "0.30" }
+uapi = { package = "pallet-revive-uapi", version = "0.11", default-features = false }
+
+cards-protocol = { path = "../../../mental-poker/protocol", default-features = false }
+cards-proofs = { path = "../../../mental-poker/proofs", default-features = false }
+cards-deck = { path = "../../../mental-poker/deck", default-features = false }
+deck-secp256k1 = { path = "../../../mental-poker/deck-secp256k1", default-features = false }
+
+ark-ec = { version = "0.5.0", default-features = false }
+ark-ff = { version = "0.5.0", default-features = false }
+ark-serialize = { version = "0.5.0", default-features = false, features = ["derive"] }
+ark-std = { version = "0.5.0", default-features = false }
+ark-secp256k1 = { version = "0.5.0", default-features = false }
+ark-transcript = { version = "0.0.5", default-features = false }

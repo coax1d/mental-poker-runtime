@@ -1,97 +1,88 @@
-# Mental Poker Runtime
+# Mental Poker on Paseo Asset Hub
 
-A Substrate solochain that implements the [mental poker](https://en.wikipedia.org/wiki/Mental_poker) protocol on-chain, with a browser-based Exploding Kittens demo.
+A browser-based Exploding Kittens demo built on the [mental poker protocol](https://en.wikipedia.org/wiki/Mental_poker): players deal, shuffle, and reveal cards with no trusted dealer.
 
-Players can deal, shuffle, and reveal cards without any trusted dealer. The chain verifies zero-knowledge proofs and stores encrypted game state, while all cryptographic operations run client-side in WebAssembly.
-
-## Repository Layout
+Architecture: shuffles run **off-chain** between players (browser WASM). A Rust contract on `pallet-revive` verifies the cryptography that matters — player key ownership, deck-agreement signatures, and per-card reveal proofs — so cheaters get rejected at submission, not just caught client-side.
 
 ```
-node/               Substrate node (block production, RPC, networking)
-runtime/            Solochain runtime (WASM blob executed by the node)
-pallets/mental-poker/  Custom pallet — game lifecycle, proof verification, card storage
-client/             Exploding Kittens web app (Vite + React + TypeScript)
+contracts/mental-poker/   Rust contract → PolkaVM bytecode for pallet-revive
+client/                   React + Vite app (game UI + WASM crypto)
 ```
 
-## Prerequisites
+## Quickstart
 
-- **Rust** (nightly) with the `wasm32-unknown-unknown` target
-- **Node.js** >= 18
-- **wasm-pack** — `cargo install wasm-pack`
-- **polkadot-sdk** checked out at `../polkadot-sdk`
-- **mental-poker** checked out at `../mental-poker` (branch `wasm-bindings`)
+You'll need:
 
-## Building the Node
+- **Rust** stable (a JSON target spec for `riscv64emac-unknown-none-polkavm` is checked in)
+- **Node.js** ≥ 18 (24 tested via nvm)
+- **[polkatool](https://github.com/paritytech/polkavm)** — `cargo install polkatool` (for inspecting the built contract; the build itself uses a vendored polkavm-linker)
+- **A Polkadot wallet extension** — [Talisman](https://talisman.xyz/), [SubWallet](https://subwallet.app/), or [polkadot-js extension](https://polkadot.js.org/extension/)
+- **PAS** on Paseo Asset Hub — get it from [faucet.polkadot.io](https://faucet.polkadot.io/) → *Polkadot Testnet (Paseo)* → *Hub (Contracts)*
+
+The build also expects the upstream `mental-poker` protocol crate (Parity Tech) checked out next to this repo. The client's `build:wasm` script consumes it:
 
 ```bash
-cargo build --release
+git clone https://github.com/paritytech/mental-poker.git ../mental-poker
 ```
 
-The binary is at `target/release/mental-poker-node`.
-
-## Running the Demo
-
-### 1. Start the node
+### 1. Build the contract
 
 ```bash
-./target/release/mental-poker-node --dev
+cd contracts/mental-poker
+make
 ```
 
-This starts a local dev chain at `ws://127.0.0.1:9944` with pre-funded Alice/Bob/Charlie/Dave accounts.
+Produces `contract.polkavm` (~75 KB).
 
-### 2. Build the WASM crypto bindings
+### 2. Deploy to Paseo Asset Hub
+
+```bash
+cd contracts/mental-poker/deploy
+npm install
+cp .env.example .env   # then edit .env with a funded SS58 mnemonic + address
+
+npm run papi:add       # fetch chain metadata (one-time)
+npm run deploy         # instantiate; writes deployment.json
+```
+
+> **Need a fresh account?** Any SS58 wallet works (polkadot.js, Talisman, SubWallet — generate, then export the mnemonic into `.env`). Fund it from [faucet.polkadot.io](https://faucet.polkadot.io/) → *Polkadot Testnet (Paseo)* → *Hub (Contracts)*. The deploy script will auto-`map_account` it on first run.
+
+The deploy script handles `Revive.map_account` for you. Copy the printed contract address into `client/src/App.tsx` (`DEFAULT_CONTRACT`), or paste it into the UI's Contract Address field at runtime.
+
+> The contract is single-game-per-instance, but `create_game` is idempotent — it wipes any prior game's state before initializing, so one deployed contract handles many games.
+
+### 3. Run the client
 
 ```bash
 cd client
 npm install
-npm run build:wasm
-```
-
-This compiles the mental-poker `play` crate to WebAssembly and copies the output into `client/src/wasm/pkg/`.
-
-### 3. Generate PAPI type descriptors
-
-With the node running:
-
-```bash
-npm run setup:papi
-```
-
-This connects to the node, reads the runtime metadata, and generates typed chain definitions in `.papi/descriptors/`.
-
-### 4. Start the web app
-
-```bash
+npm run setup        # builds the WASM crypto module + fetches PAPI metadata
 npm run dev
 ```
 
-Open [http://localhost:5173](http://localhost:5173) in your browser.
+Open <http://localhost:5173>:
 
-### 5. Play
+1. Go to the **Play** tab and click **Connect** to grant Talisman (or whatever extension) access to two accounts.
+2. Pick them from the **Player 1** and **Player 2** dropdowns. Both need PAS balance and will be auto-mapped on `pallet-revive` if not already.
+3. Click **Start Game**.
 
-- Read the **About** tab for an overview of how the game and cryptography work
-- Switch to the **Play** tab
-- Select number of players (2-4), deck size, and game speed
-- Click **Start Game**
-- Watch the game log as it progresses through: setup, registration, masking, shuffling, dealing, and play
+Each transaction prompts your wallet to sign. Block time on Paseo AH is ~6 s, which is the floor for per-tx wait. A 5-card deal in 2-player runs ~10 reveal txs before play begins.
 
-The demo controls all players locally (simulation mode) so you can see the full protocol in action.
+## How the cryptography lands on chain
 
-## How It Works
+| Selector | Message | What the contract verifies |
+|---|---|---|
+| `0x01` | `create_game` | Wipes any prior game, stores new `GameInfo` |
+| `0x02` | `register_player(hello)` | Schnorr proof of secret-key ownership (`verify_player`) |
+| `0x03` | `submit_agreed_deck(deck, sigs[])` | One `verify_key_ownership` per player against the deck bytes |
+| `0x04` | `submit_reveal(card_idx, msg)` | Per-card discrete-log equality proof (`verify_single_reveal`) |
+| `0x10` | `query_game()` | Read-only |
 
-1. **Key Generation** — Each player generates a secp256k1 keypair and publishes a public key with a proof of knowledge
-2. **Masking** — The plaintext deck is encrypted using all players' combined public keys
-3. **Shuffling** — Each player re-randomizes and re-orders the encrypted deck, submitting a zero-knowledge proof that the shuffle is valid
-4. **Revealing** — To reveal a card, every player submits a partial decryption token with a correctness proof; the card is only readable when all tokens are combined
+The heavy shuffle verification (`verify_shuffle`) is **not** on chain — it doesn't fit in pallet-revive's gas/heap budget. Players verify each other's shuffles off-chain before signing the agreed deck. The deck-agreement signatures (`0x03`) are what binds each player's commitment to the final shuffled deck.
 
-The pallet verifies all proofs on-chain. No player can see cards early or manipulate the deck.
+## Development notes
 
-## Quick Reference
-
-| Command | Description |
-|---|---|
-| `cargo build --release` | Build the node |
-| `./target/release/mental-poker-node --dev` | Run local dev chain |
-| `cd client && npm run build:wasm` | Build WASM crypto |
-| `cd client && npm run setup:papi` | Generate chain type bindings |
-| `cd client && npm run dev` | Start the web app |
+- The contract is its own Cargo workspace (`contracts/mental-poker/`), independent of the client and of any host-side Rust workspaces.
+- `make` in `contracts/mental-poker/` builds the contract via a vendored `polkavm-linker` (`linker/`) pinned to the polkavm 0.30 / `ReviveV1` target the chain expects. `polkatool link` won't work — it hardcodes `Latest`.
+- Storage values in pallet-revive are capped at 416 bytes per entry; the deck is chunked at 400 bytes (`DECK_CHUNK_SIZE` in `src/main.rs`).
+- The client's `build:wasm` script invokes `wasm-pack` against `../../mental-poker/play/`. Make sure that path is checked out.

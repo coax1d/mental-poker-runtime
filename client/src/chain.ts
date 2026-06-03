@@ -1,11 +1,16 @@
 /**
- * Chain interaction via polkadot-api (PAPI).
+ * Chain interaction via polkadot-api (PAPI) — contract-based architecture.
  *
- * SETUP REQUIRED: Before using, generate PAPI descriptors:
- *   1. Start the node:  cd mental-poker-runtime && ./target/release/mental-poker-node --dev
- *   2. Generate types:  cd client && npx papi add -w ws://127.0.0.1:9944 mpr
+ * All game operations are submitted as `Revive.call` extrinsics to the
+ * mental-poker contract on Paseo Asset Hub. Shuffles happen off-chain;
+ * the contract verifies player registration (Schnorr proofs), deck
+ * agreement signatures, and reveal proofs.
  *
- * This creates .papi/descriptors/ with typed chain definitions.
+ * SETUP: The PAPI descriptors must be generated for Paseo Asset Hub:
+ *   npx papi add passet -f ../passet.metadata.scale
+ *
+ * The contract address is passed as a parameter (from deployment.json
+ * or hardcoded after deploy).
  */
 
 import {
@@ -13,284 +18,367 @@ import {
   type PolkadotSigner,
   type PolkadotClient,
   Binary,
+  FixedSizeBinary,
 } from "polkadot-api";
 import { getWsProvider } from "polkadot-api/ws-provider/web";
-import { mpr } from "@polkadot-api/descriptors";
 
-type Api = ReturnType<PolkadotClient["getTypedApi"]>;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type Api = any;
 export type TypedApi = Api;
 
 export interface ChainConnection {
   client: PolkadotClient;
   api: Api;
+  contractAddress: string;
 }
 
-/** Connect to the Substrate node. */
+const DEFAULT_WS = "wss://sys.ibp.network/asset-hub-paseo";
+
+/** Connect to Paseo Asset Hub. */
 export async function connect(
-  wsUrl: string = "ws://127.0.0.1:9944",
+  contractAddress: string,
+  wsUrl: string = DEFAULT_WS,
 ): Promise<ChainConnection> {
+  // Lazily import descriptors
+  const { passet } = await import("@polkadot-api/descriptors");
   const provider = getWsProvider(wsUrl);
   const client = createClient(provider);
-  const api = client.getTypedApi(mpr);
-  return { client, api };
+  const api = client.getTypedApi(passet);
+  return { client, api, contractAddress };
 }
 
-/** Disconnect from the node. */
+/** Disconnect. */
 export function disconnect(conn: ChainConnection): void {
   conn.client.destroy();
 }
 
+/** Query whether an account is already registered in pallet-revive's mapping. */
+export async function isMapped(
+  conn: ChainConnection,
+  h160: Uint8Array,
+): Promise<boolean> {
+  const key = FixedSizeBinary.fromBytes(h160);
+  const value = await conn.api.query.Revive.OriginalAccount.getValue(key);
+  return value != null;
+}
+
+/**
+ * Ensure the account is mapped on pallet-revive (SS58 → H160).
+ * Queries storage first to avoid a ~6s tx round-trip when already mapped.
+ * Only submits map_account if storage shows the account is unmapped.
+ */
+export async function ensureMapped(
+  conn: ChainConnection,
+  signer: PolkadotSigner,
+  h160: Uint8Array,
+): Promise<void> {
+  if (await isMapped(conn, h160)) return;
+
+  let result;
+  try {
+    result = await submitOnInclusion(conn.api.tx.Revive.map_account(), signer);
+  } catch (e) {
+    if (isAlreadyMappedError(e)) return;
+    throw e;
+  }
+  if (result.ok) return;
+
+  const failed = result.events?.find(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (e: any) => e.type === "System" && e.value?.type === "ExtrinsicFailed",
+  );
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const err = (failed as any)?.value?.value?.dispatch_error;
+  if (
+    err?.type === "Module" &&
+    err.value?.type === "Revive" &&
+    err.value?.value?.type === "AccountAlreadyMapped"
+  ) {
+    return;
+  }
+  throw new Error(`map_account failed: ${JSON.stringify(err)}`);
+}
+
+function isAlreadyMappedError(e: unknown): boolean {
+  const s = String(e);
+  return s.includes("AccountAlreadyMapped");
+}
+
+// --- Internal helpers ---
+
+function destFromAddress(address: string): FixedSizeBinary<20> {
+  const hex = address.startsWith("0x") ? address.slice(2) : address;
+  const bytes = new Uint8Array(
+    hex.match(/.{2}/g)!.map((b) => parseInt(b, 16)),
+  );
+  return FixedSizeBinary.fromBytes(bytes);
+}
+
+/** Submit a contract call and return as soon as it's included in a best block (don't wait for finalization). */
+async function callContract(
+  conn: ChainConnection,
+  signer: PolkadotSigner,
+  data: Uint8Array,
+  refTimeLimit = 500_000_000_000n,
+): Promise<{ ok: boolean; refTime?: bigint; proofSize?: bigint }> {
+  const tx = conn.api.tx.Revive.call({
+    dest: destFromAddress(conn.contractAddress),
+    value: 0n,
+    weight_limit: { ref_time: refTimeLimit, proof_size: 5_000_000n },
+    storage_deposit_limit: 10_000_000_000_000n,
+    data: Binary.fromBytes(data),
+  });
+
+  const result = await submitOnInclusion(tx, signer);
+
+  let refTime: bigint | undefined;
+  let proofSize: bigint | undefined;
+
+  for (const event of result.events ?? []) {
+    if (event.type === "System" && event.value?.type === "ExtrinsicSuccess") {
+      const w = (event.value.value as any)?.dispatch_info?.weight;
+      refTime = w?.ref_time != null ? BigInt(w.ref_time) : undefined;
+      proofSize = w?.proof_size != null ? BigInt(w.proof_size) : undefined;
+    }
+  }
+
+  return { ok: result.ok, refTime, proofSize };
+}
+
+/**
+ * Wrap signSubmitAndWatch: resolve as soon as the tx is found in a best block
+ * (~one block time on Paseo AH, ~6s), instead of waiting for GRANDPA finalization (~12-18s).
+ */
+function submitOnInclusion(
+  tx: { signSubmitAndWatch: (signer: PolkadotSigner) => any },
+  signer: PolkadotSigner,
+): Promise<{ ok: boolean; events: any[] }> {
+  return new Promise((resolve, reject) => {
+    let sub: { unsubscribe: () => void } | null = null;
+    sub = tx.signSubmitAndWatch(signer).subscribe({
+      next: (ev: any) => {
+        if (ev.type === "txBestBlocksState") {
+          if (ev.found) {
+            sub?.unsubscribe();
+            resolve({ ok: ev.ok, events: ev.events ?? [] });
+          } else if (!ev.isValid) {
+            sub?.unsubscribe();
+            reject(new Error("tx dropped from pool (invalid)"));
+          }
+        } else if (ev.type === "finalized") {
+          // Fallback: if we somehow missed best-block state, resolve on finalized.
+          sub?.unsubscribe();
+          resolve({ ok: ev.ok, events: ev.events ?? [] });
+        }
+      },
+      error: (err: unknown) => {
+        sub?.unsubscribe();
+        reject(err);
+      },
+    });
+  });
+}
+
+// --- Contract message builders ---
+
+/** Encode u16 big-endian */
+function u16be(n: number): Uint8Array {
+  return new Uint8Array([(n >> 8) & 0xff, n & 0xff]);
+}
+
+/** Encode u32 big-endian */
+function u32be(n: number): Uint8Array {
+  const b = new Uint8Array(4);
+  new DataView(b.buffer).setUint32(0, n);
+  return b;
+}
+
+/** Concatenate Uint8Arrays */
+function concat(...parts: Uint8Array[]): Uint8Array {
+  const total = parts.reduce((s, p) => s + p.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const p of parts) {
+    out.set(p, offset);
+    offset += p.length;
+  }
+  return out;
+}
+
+// --- Selectors ---
+const SEL_CREATE_GAME = 0x01;
+const SEL_REGISTER_PLAYER = 0x02;
+const SEL_SUBMIT_AGREED_DECK = 0x03;
+const SEL_SUBMIT_REVEAL = 0x04;
+const SEL_CLAIM_TIMEOUT = 0x05;
+const SEL_QUERY_GAME = 0x10;
+
 // --- Extrinsic Helpers ---
 
+/**
+ * Create a new game. Returns immediately (no game_id — single game per contract).
+ */
 export async function createGame(
-  api: Api,
+  conn: ChainConnection,
   signer: PolkadotSigner,
   deckSize: number,
   numPlayers: number,
-): Promise<number> {
-  const result = await (api as any).tx.MentalPoker.create_game({
-    deck_size: deckSize,
-    num_players: numPlayers,
-  }).signAndSubmit(signer);
-
-  // Extract game_id from GameCreated event
-  for (const event of result.events) {
-    if (
-      event.type === "MentalPoker" &&
-      event.value.type === "GameCreated"
-    ) {
-      return event.value.value.game_id;
-    }
-  }
-  // Fallback: read GameCounter - 1
-  const counter = await (api as any).query.MentalPoker.GameCounter.getValue();
-  return counter - 1;
+  timeoutBlocks = 100,
+): Promise<void> {
+  const data = concat(
+    new Uint8Array([SEL_CREATE_GAME]),
+    u16be(deckSize),
+    new Uint8Array([numPlayers]),
+    u32be(timeoutBlocks),
+  );
+  const result = await callContract(conn, signer, data);
+  if (!result.ok) throw new Error("create_game failed (contract reverted)");
 }
 
+/**
+ * Register a player. `playerHelloBytes` is the compressed PlayerHello
+ * (keypair.prove_player(h160Address)).
+ */
 export async function registerPlayer(
-  api: Api,
+  conn: ChainConnection,
   signer: PolkadotSigner,
-  gameId: number,
   playerHelloBytes: Uint8Array,
 ): Promise<void> {
-  await (api as any).tx.MentalPoker.register_player({
-    game_id: gameId,
-    player_hello_bytes: Binary.fromBytes(playerHelloBytes),
-  }).signAndSubmit(signer);
+  const data = concat(
+    new Uint8Array([SEL_REGISTER_PLAYER]),
+    playerHelloBytes,
+  );
+  const result = await callContract(conn, signer, data);
+  if (!result.ok) throw new Error("register_player failed (contract reverted)");
 }
 
-export async function submitMaskedDeck(
-  api: Api,
+/**
+ * Submit the agreed-upon deck with per-player signatures.
+ *
+ * @param deckBytes - Serialized Vec<MaskedCard> (compressed arkworks)
+ * @param signatures - One ZKProofKeyOwnership per player, in registration order
+ */
+export async function submitAgreedDeck(
+  conn: ChainConnection,
   signer: PolkadotSigner,
-  gameId: number,
-  maskedDeckBytes: Uint8Array,
+  deckBytes: Uint8Array,
+  signatures: Uint8Array[],
 ): Promise<void> {
-  await (api as any).tx.MentalPoker.submit_masked_deck({
-    game_id: gameId,
-    masked_deck_bytes: Binary.fromBytes(maskedDeckBytes),
-  }).signAndSubmit(signer);
+  const parts: Uint8Array[] = [
+    new Uint8Array([SEL_SUBMIT_AGREED_DECK]),
+    u32be(deckBytes.length),
+    deckBytes,
+  ];
+  for (const sig of signatures) {
+    parts.push(u32be(sig.length));
+    parts.push(sig);
+  }
+  const data = concat(...parts);
+  // Deck agreement verifies N signatures — needs more gas
+  const result = await callContract(conn, signer, data, 1_200_000_000_000n);
+  if (!result.ok) throw new Error("submit_agreed_deck failed (contract reverted)");
 }
 
-export async function submitShuffle(
-  api: Api,
-  signer: PolkadotSigner,
-  gameId: number,
-  shuffleMsgBytes: Uint8Array,
-): Promise<void> {
-  await (api as any).tx.MentalPoker.submit_shuffle({
-    game_id: gameId,
-    shuffle_msg_bytes: Binary.fromBytes(shuffleMsgBytes),
-  }).signAndSubmit(signer);
-}
-
+/**
+ * Submit a reveal token for a specific card.
+ */
 export async function submitReveal(
-  api: Api,
+  conn: ChainConnection,
   signer: PolkadotSigner,
-  gameId: number,
   cardIndex: number,
   revealMsgBytes: Uint8Array,
 ): Promise<void> {
-  await (api as any).tx.MentalPoker.submit_reveal({
-    game_id: gameId,
-    card_index: cardIndex,
-    reveal_msg_bytes: Binary.fromBytes(revealMsgBytes),
-  }).signAndSubmit(signer);
+  const data = concat(
+    new Uint8Array([SEL_SUBMIT_REVEAL]),
+    u16be(cardIndex),
+    revealMsgBytes,
+  );
+  const result = await callContract(conn, signer, data);
+  if (!result.ok) throw new Error("submit_reveal failed (contract reverted)");
 }
 
-// --- Storage Queries ---
-
-export async function readCurrentDeck(
-  api: Api,
-  gameId: number,
-): Promise<Uint8Array> {
-  const raw: Binary = await (api as any).query.MentalPoker.CurrentDeck.getValue(gameId);
-  return raw.asBytes();
+/**
+ * Claim timeout — cancels the game if the deck deadline has passed.
+ */
+export async function claimTimeout(
+  conn: ChainConnection,
+  signer: PolkadotSigner,
+): Promise<void> {
+  const data = new Uint8Array([SEL_CLAIM_TIMEOUT]);
+  const result = await callContract(conn, signer, data);
+  if (!result.ok) throw new Error("claim_timeout failed");
 }
 
-export async function readAggregateKeyData(
-  api: Api,
-  gameId: number,
-): Promise<Uint8Array> {
-  const raw: Binary = await (api as any).query.MentalPoker.AggregateKeyData.getValue(gameId);
-  return raw.asBytes();
-}
+// --- Game phase constants ---
+export const PHASE_NONE = 0;
+export const PHASE_REGISTRATION = 1;
+export const PHASE_AWAITING_DECK = 2;
+export const PHASE_PLAYING = 3;
+export const PHASE_COMPLETE = 4;
+export const PHASE_CANCELLED = 5;
 
+export const PHASE_NAMES: Record<number, string> = {
+  [PHASE_NONE]: "None",
+  [PHASE_REGISTRATION]: "Registration",
+  [PHASE_AWAITING_DECK]: "AwaitingDeck",
+  [PHASE_PLAYING]: "Playing",
+  [PHASE_COMPLETE]: "Complete",
+  [PHASE_CANCELLED]: "Cancelled",
+};
+
+/** Game info as returned by the contract's query_game (selector 0x10). */
 export interface GameInfo {
-  phase: string;
+  phase: number;
+  phaseName: string;
   deck_size: number;
   num_players: number;
   registered_count: number;
+  deadline_block: number;
 }
 
-export async function readGameInfo(
-  api: Api,
-  gameId: number,
-): Promise<GameInfo | undefined> {
-  const raw = await (api as any).query.MentalPoker.Games.getValue(gameId);
-  if (!raw) return undefined;
-  // PAPI represents SCALE enums as { type: "VariantName" }
-  const phase = typeof raw.phase === "string" ? raw.phase : raw.phase?.type ?? String(raw.phase);
-  return {
-    phase,
-    deck_size: raw.deck_size,
-    num_players: raw.num_players,
-    registered_count: raw.registered_count,
-  };
-}
-
-export async function readShuffleIndex(
-  api: Api,
-  gameId: number,
-): Promise<number> {
-  return (api as any).query.MentalPoker.ShuffleIndex.getValue(gameId);
-}
-
-/** Read the ordered list of player SS58 addresses for a game. */
-export async function readPlayerOrder(
-  api: Api,
-  gameId: number,
-): Promise<string[]> {
-  const raw = await (api as any).query.MentalPoker.PlayerOrder.getValue(gameId);
-  if (!raw) return [];
-  // PAPI returns AccountIds as SS58String
-  return (raw as any[]).map((v: any) => String(v));
-}
-
-/** Read a single reveal token from storage. */
-export async function readRevealToken(
-  api: Api,
-  gameId: number,
-  cardIndex: number,
-  player: string,
-): Promise<Uint8Array | undefined> {
-  const raw = await (api as any).query.MentalPoker.RevealTokens.getValue(
-    gameId,
-    cardIndex,
-    player,
-  );
-  if (!raw) return undefined;
-  return (raw as Binary).asBytes();
-}
-
-/** Read the reveal count for a (game, card). */
-export async function readRevealCount(
-  api: Api,
-  gameId: number,
-  cardIndex: number,
-): Promise<number> {
-  return (api as any).query.MentalPoker.RevealCount.getValue(gameId, cardIndex);
-}
-
-export async function initiateReshuffle(
-  api: Api,
+/**
+ * Query game state. This submits a transaction (costs gas) since we can't
+ * do dry-run calls via PAPI descriptors on Paseo Asset Hub yet.
+ *
+ * TODO: Switch to `state_call ReviveApi.call` or `eth_call` for free reads.
+ */
+export async function queryGame(
+  conn: ChainConnection,
   signer: PolkadotSigner,
-  gameId: number,
-  fromCardIndex: number,
-  reshuffleDeckBytes: Uint8Array,
-): Promise<void> {
-  await (api as any).tx.MentalPoker.initiate_reshuffle({
-    game_id: gameId,
-    from_card_index: fromCardIndex,
-    reshuffle_deck_bytes: Binary.fromBytes(reshuffleDeckBytes),
-  }).signAndSubmit(signer);
-}
-
-export async function readReshuffleDeck(
-  api: Api,
-  gameId: number,
-): Promise<Uint8Array | undefined> {
-  const raw = await (api as any).query.MentalPoker.ReshuffleDeck.getValue(gameId);
-  if (!raw) return undefined;
-  return (raw as Binary).asBytes();
-}
-
-export async function readReshuffleFromIndex(
-  api: Api,
-  gameId: number,
-): Promise<number | undefined> {
-  return (api as any).query.MentalPoker.ReshuffleFromIndex.getValue(gameId);
+): Promise<GameInfo> {
+  const data = new Uint8Array([SEL_QUERY_GAME]);
+  const result = await callContract(conn, signer, data);
+  if (!result.ok) throw new Error("query_game failed");
+  // Note: we can't read the 32-byte return value from extrinsic events.
+  // For now, return a placeholder — the harness tracks state locally.
+  return {
+    phase: PHASE_NONE,
+    phaseName: "Unknown",
+    deck_size: 0,
+    num_players: 0,
+    registered_count: 0,
+    deadline_block: 0,
+  };
 }
 
 // --- Polling Helpers ---
 
-export type GamePhaseOnChain = "Registration" | "Masking" | "Shuffling" | "Playing" | "Reshuffling" | "Complete";
-
-/**
- * Poll until the on-chain game phase matches the expected value.
- * Returns the game info once the condition is met.
- */
-export async function waitForPhase(
-  api: Api,
-  gameId: number,
-  phase: GamePhaseOnChain,
-  signal?: { stopped: boolean },
-  intervalMs = 1000,
-): Promise<{ phase: string; deck_size: number; num_players: number; registered_count: number }> {
-  while (true) {
-    if (signal?.stopped) throw new Error("Stopped");
-    const info = await readGameInfo(api, gameId);
-    if (info && info.phase === phase) return info;
-    await sleep(intervalMs);
-  }
-}
-
-/**
- * Poll until the shuffle index reaches the target value.
- */
-export async function waitForShuffleIndex(
-  api: Api,
-  gameId: number,
-  target: number,
-  signal?: { stopped: boolean },
-  intervalMs = 1000,
-): Promise<void> {
-  while (true) {
-    if (signal?.stopped) throw new Error("Stopped");
-    const idx = await readShuffleIndex(api, gameId);
-    if (idx >= target) return;
-    await sleep(intervalMs);
-  }
-}
-
-/**
- * Poll until the reveal count for a card reaches the target.
- */
-export async function waitForRevealCount(
-  api: Api,
-  gameId: number,
-  cardIndex: number,
-  target: number,
-  signal?: { stopped: boolean },
-  intervalMs = 500,
-): Promise<void> {
-  while (true) {
-    if (signal?.stopped) throw new Error("Stopped");
-    const count = await readRevealCount(api, gameId, cardIndex);
-    if (count >= target) return;
-    await sleep(intervalMs);
-  }
-}
-
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Poll until a condition is met. Uses a callback since we can't read
+ * contract return data from extrinsic events.
+ */
+export async function waitFor(
+  check: () => Promise<boolean>,
+  signal?: { stopped: boolean },
+  intervalMs = 2000,
+): Promise<void> {
+  while (true) {
+    if (signal?.stopped) throw new Error("Stopped");
+    if (await check()) return;
+    await sleep(intervalMs);
+  }
 }

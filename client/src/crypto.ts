@@ -55,9 +55,55 @@ export function deckFromBytes(bytes: Uint8Array): MaskedCards {
   return MaskedCards.deserialize(bytes);
 }
 
-/** Deserialize AggregatedPublicKeys from on-chain AggregateKeyData storage. */
+/** Deserialize AggregatedPublicKeys from serialized bytes. */
 export function aggKeysFromBytes(bytes: Uint8Array): AggregatedPublicKeys {
   return AggregatedPublicKeys.deserialize(bytes);
+}
+
+/**
+ * Build AggregatedPublicKeys from player hellos and their names/H160 addresses.
+ * This replaces the on-chain key aggregation for the off-chain shuffle flow.
+ */
+export function aggKeysFromHellos(
+  players: { helloBytes: Uint8Array; nameBytes: Uint8Array }[],
+): AggregatedPublicKeys {
+  // Pack into the flat buffer format expected by the WASM binding:
+  // [num_players: u32 LE, then for each: hello_len: u32 LE, hello_bytes, name_len: u32 LE, name_bytes]
+  let totalSize = 4;
+  for (const p of players) {
+    totalSize += 4 + p.helloBytes.length + 4 + p.nameBytes.length;
+  }
+  const buf = new Uint8Array(totalSize);
+  const view = new DataView(buf.buffer);
+  let offset = 0;
+
+  view.setUint32(offset, players.length, true); // LE
+  offset += 4;
+  for (const p of players) {
+    view.setUint32(offset, p.helloBytes.length, true);
+    offset += 4;
+    buf.set(p.helloBytes, offset);
+    offset += p.helloBytes.length;
+    view.setUint32(offset, p.nameBytes.length, true);
+    offset += 4;
+    buf.set(p.nameBytes, offset);
+    offset += p.nameBytes.length;
+  }
+
+  return AggregatedPublicKeys.buildFromHellos(buf);
+}
+
+/**
+ * Extract the shuffled deck from a ShuffleMessage by verifying it.
+ * Returns the new MaskedCards after the shuffle.
+ */
+export function verifyAndExtractDeck(
+  aggKeys: AggregatedPublicKeys,
+  playerIndex: number,
+  originalDeck: MaskedCards,
+  shuffleMsgBytes: Uint8Array,
+): MaskedCards {
+  return aggKeys.verify_shuffle(playerIndex, originalDeck, shuffleMsgBytes);
 }
 
 /** Verify a player hello message and return their public key bytes. */

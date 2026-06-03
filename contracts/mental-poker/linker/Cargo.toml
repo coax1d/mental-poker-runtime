@@ -1,0 +1,15 @@
+[package]
+name = "revive-linker"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone workspace — not part of the contract's no_std build.
+[workspace]
+
+[[bin]]
+name = "revive-linker"
+path = "src/main.rs"
+
+[dependencies]
+polkavm-linker = "0.30.0"
