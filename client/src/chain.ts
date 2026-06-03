@@ -52,6 +52,58 @@ export function disconnect(conn: ChainConnection): void {
   conn.client.destroy();
 }
 
+/** Query whether an account is already registered in pallet-revive's mapping. */
+export async function isMapped(
+  conn: ChainConnection,
+  h160: Uint8Array,
+): Promise<boolean> {
+  const key = FixedSizeBinary.fromBytes(h160);
+  const value = await conn.api.query.Revive.OriginalAccount.getValue(key);
+  return value != null;
+}
+
+/**
+ * Ensure the account is mapped on pallet-revive (SS58 → H160).
+ * Queries storage first to avoid a ~6s tx round-trip when already mapped.
+ * Only submits map_account if storage shows the account is unmapped.
+ */
+export async function ensureMapped(
+  conn: ChainConnection,
+  signer: PolkadotSigner,
+  h160: Uint8Array,
+): Promise<void> {
+  if (await isMapped(conn, h160)) return;
+
+  let result;
+  try {
+    result = await submitOnInclusion(conn.api.tx.Revive.map_account(), signer);
+  } catch (e) {
+    if (isAlreadyMappedError(e)) return;
+    throw e;
+  }
+  if (result.ok) return;
+
+  const failed = result.events?.find(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (e: any) => e.type === "System" && e.value?.type === "ExtrinsicFailed",
+  );
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const err = (failed as any)?.value?.value?.dispatch_error;
+  if (
+    err?.type === "Module" &&
+    err.value?.type === "Revive" &&
+    err.value?.value?.type === "AccountAlreadyMapped"
+  ) {
+    return;
+  }
+  throw new Error(`map_account failed: ${JSON.stringify(err)}`);
+}
+
+function isAlreadyMappedError(e: unknown): boolean {
+  const s = String(e);
+  return s.includes("AccountAlreadyMapped");
+}
+
 // --- Internal helpers ---
 
 function destFromAddress(address: string): FixedSizeBinary<20> {
@@ -62,20 +114,22 @@ function destFromAddress(address: string): FixedSizeBinary<20> {
   return FixedSizeBinary.fromBytes(bytes);
 }
 
-/** Submit a contract call and return the result. */
+/** Submit a contract call and return as soon as it's included in a best block (don't wait for finalization). */
 async function callContract(
   conn: ChainConnection,
   signer: PolkadotSigner,
   data: Uint8Array,
   refTimeLimit = 500_000_000_000n,
 ): Promise<{ ok: boolean; refTime?: bigint; proofSize?: bigint }> {
-  const result = await conn.api.tx.Revive.call({
+  const tx = conn.api.tx.Revive.call({
     dest: destFromAddress(conn.contractAddress),
     value: 0n,
     weight_limit: { ref_time: refTimeLimit, proof_size: 5_000_000n },
     storage_deposit_limit: 10_000_000_000_000n,
     data: Binary.fromBytes(data),
-  }).signAndSubmit(signer);
+  });
+
+  const result = await submitOnInclusion(tx, signer);
 
   let refTime: bigint | undefined;
   let proofSize: bigint | undefined;
@@ -89,6 +143,40 @@ async function callContract(
   }
 
   return { ok: result.ok, refTime, proofSize };
+}
+
+/**
+ * Wrap signSubmitAndWatch: resolve as soon as the tx is found in a best block
+ * (~one block time on Paseo AH, ~6s), instead of waiting for GRANDPA finalization (~12-18s).
+ */
+function submitOnInclusion(
+  tx: { signSubmitAndWatch: (signer: PolkadotSigner) => any },
+  signer: PolkadotSigner,
+): Promise<{ ok: boolean; events: any[] }> {
+  return new Promise((resolve, reject) => {
+    let sub: { unsubscribe: () => void } | null = null;
+    sub = tx.signSubmitAndWatch(signer).subscribe({
+      next: (ev: any) => {
+        if (ev.type === "txBestBlocksState") {
+          if (ev.found) {
+            sub?.unsubscribe();
+            resolve({ ok: ev.ok, events: ev.events ?? [] });
+          } else if (!ev.isValid) {
+            sub?.unsubscribe();
+            reject(new Error("tx dropped from pool (invalid)"));
+          }
+        } else if (ev.type === "finalized") {
+          // Fallback: if we somehow missed best-block state, resolve on finalized.
+          sub?.unsubscribe();
+          resolve({ ok: ev.ok, events: ev.events ?? [] });
+        }
+      },
+      error: (err: unknown) => {
+        sub?.unsubscribe();
+        reject(err);
+      },
+    });
+  });
 }
 
 // --- Contract message builders ---
