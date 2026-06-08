@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Deploy/call scripts for the mental-poker contract on Paseo Asset Hub.",
   "scripts": {
-    "papi:add": "papi add passet -w wss://sys.ibp.network/asset-hub-paseo",
+    "papi:add": "tsx scripts/papi-add.ts",
     "papi:update": "papi",
     "deploy": "tsx scripts/deploy.ts",
     "test-flow": "tsx scripts/test-flow.ts"
