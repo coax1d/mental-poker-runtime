@@ -10,17 +10,26 @@
 //!                  timeout → Cancelled (forfeit non-submitters)
 //!
 //! ## Message selectors
-//!   0x01  create_game(deck_size: u32, num_players: u8, timeout_blocks: u32)
-//!   0x02  register_player(player_hello_bytes)
+//!   0x01  create_game(deck_size: u16, num_players: u8, timeout_blocks: u32, card_set)
+//!   0x02  register_player(player_hello_bytes) -- value sent credits escrow
 //!   0x03  submit_agreed_deck(deck_bytes, [sig per player])
-//!   0x04  submit_reveal(card_index: u32, reveal_msg_bytes)
+//!   0x04  submit_reveal(card_index: u16, reveal_msg_bytes)
 //!   0x05  claim_timeout()
 //!   0x10  query_game() → returns GameInfo
+//!   0x11  query_escrow() → returns [num_players u8, balance u128 LE per player]
+//!
+//! ## Card-set layout (passed to create_game after timeout, also stored at b"cset")
+//!   [safe_count u16 BE][defuse_count u16 BE][ek_count u16 BE][custom_count u8]
+//!   [(addr 20B ++ count u16 BE) × custom_count]
+//!   Sum of all counts must equal deck_size. custom_count ≤ MAX_CUSTOM_CARD_TYPES.
+//!   In Stage 1 the card-set is stored but no card contract is called yet.
 //!
 //! ## Storage layout (variable-length keys via set_storage/get_storage)
 //!   b"game"                → GameInfo (phase, deck_size, num_players, registered, deadline)
 //!   b"plyr" ++ [idx u8]    → 20-byte H160 caller address
 //!   b"pk" ++ [idx u8]      → PlayerPublicKey (compressed secp256k1 point, 33 bytes)
+//!   b"esc" ++ [idx u8]     → u128 LE escrow balance per player
+//!   b"cset"                → card-set blob (layout above)
 //!   b"deck"                → Vec<MaskedCard> (arkworks compressed)
 //!   b"rv" ++ [card:u16] ++ [player:u8] → RevealMessage (compressed)
 //!   b"rc" ++ [card:u16]    → u32 reveal count
@@ -85,6 +94,7 @@ const SEL_SUBMIT_AGREED_DECK: u8 = 0x03;
 const SEL_SUBMIT_REVEAL: u8 = 0x04;
 const SEL_CLAIM_TIMEOUT: u8 = 0x05;
 const SEL_QUERY_GAME: u8 = 0x10;
+const SEL_QUERY_ESCROW: u8 = 0x11;
 
 // Status codes for revert output
 const STATUS_OK: u8 = 0;
@@ -100,6 +110,12 @@ const STATUS_CARD_OOB: u8 = 9;
 const STATUS_TIMEOUT_NOT_REACHED: u8 = 10;
 #[allow(dead_code)]
 const STATUS_GAME_EXISTS: u8 = 11;
+const STATUS_BAD_CARD_SET: u8 = 12;
+
+/// Cap on how many distinct custom card-contract types a game may use.
+/// Keeps the b"cset" blob under pallet-revive's 416-byte storage limit:
+///   7 (counts/header) + 22 × 16 = 359 bytes max.
+const MAX_CUSTOM_CARD_TYPES: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Storage helpers
@@ -155,13 +171,17 @@ fn clear_at(key: &[u8]) {
 /// Wipe per-player, deck, and reveal rows from a prior game so a fresh
 /// create_game starts from clean state.
 fn clear_prior_game(prior: &GameInfo) {
-    // Per-player rows
+    // Per-player rows (address, public key, escrow)
     for p in 0..prior.num_players {
         let plyr_key = [b'p', b'l', b'y', b'r', p];
         clear_at(&plyr_key);
         let pk_key = [b'p', b'k', p];
         clear_at(&pk_key);
+        let esc_key = [b'e', b's', b'c', p];
+        clear_at(&esc_key);
     }
+    // Card-set blob from any prior game
+    clear_at(b"cset");
     // Per-card reveal rows + counts
     for card in 0..prior.deck_size {
         let cb = card.to_be_bytes();
@@ -224,6 +244,41 @@ fn load_player_pk_bytes(idx: u8) -> Option<Vec<u8>> {
         Ok(()) => {
             let remaining = out.len();
             let len = buf_len - remaining;
+            buf.truncate(len);
+            Some(buf)
+        }
+        Err(_) => None,
+    }
+}
+
+fn store_escrow(idx: u8, amount: u128) {
+    let key = [b'e', b's', b'c', idx];
+    api::set_storage(STORAGE, &key, &amount.to_le_bytes());
+}
+
+fn load_escrow(idx: u8) -> u128 {
+    let key = [b'e', b's', b'c', idx];
+    let mut buf = [0u8; 16];
+    let mut out: &mut [u8] = &mut buf;
+    match api::get_storage(STORAGE, &key, &mut out) {
+        Ok(()) => u128::from_le_bytes(buf),
+        Err(_) => 0,
+    }
+}
+
+fn store_card_set(bytes: &[u8]) {
+    api::set_storage(STORAGE, b"cset", bytes);
+}
+
+#[allow(dead_code)]
+fn load_card_set() -> Option<Vec<u8>> {
+    // Max card-set blob size: 7 (header) + 22 * MAX_CUSTOM_CARD_TYPES = 359 bytes
+    let mut buf = alloc::vec![0u8; 416];
+    let mut out: &mut [u8] = &mut buf;
+    match api::get_storage(STORAGE, b"cset", &mut out) {
+        Ok(()) => {
+            let remaining = out.len();
+            let len = buf.len() - remaining;
             buf.truncate(len);
             Some(buf)
         }
@@ -331,6 +386,15 @@ fn current_block() -> u32 {
     u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
 }
 
+/// Value (PAS) attached to the current call, truncated to u128.
+fn value_transferred_u128() -> u128 {
+    let mut buf = [0u8; 32];
+    api::value_transferred(&mut buf);
+    let mut lo = [0u8; 16];
+    lo.copy_from_slice(&buf[0..16]);
+    u128::from_le_bytes(lo)
+}
+
 fn find_player_index(caller: &[u8; 20], num: u8) -> Option<u8> {
     for i in 0..num {
         if let Some(addr) = load_player_addr(i) {
@@ -388,6 +452,7 @@ pub extern "C" fn call() {
         SEL_SUBMIT_REVEAL => msg_submit_reveal(&input[1..]),
         SEL_CLAIM_TIMEOUT => msg_claim_timeout(),
         SEL_QUERY_GAME => msg_query_game(),
+        SEL_QUERY_ESCROW => msg_query_escrow(),
         _ => return_status(STATUS_BAD_INPUT),
     }
 }
@@ -405,7 +470,10 @@ fn msg_create_game(input: &[u8]) -> ! {
         }
     }
 
-    if input.len() < 7 {
+    // Base header: deck_size(u16) + num_players(u8) + timeout(u32) = 7 bytes
+    // Card-set header: safe(u16) + defuse(u16) + ek(u16) + custom_count(u8) = 7 bytes
+    // Minimum input: 14 bytes (no custom cards)
+    if input.len() < 14 {
         return_status(STATUS_BAD_INPUT);
     }
     let deck_size = read_u16_be(input, 0);
@@ -415,6 +483,34 @@ fn msg_create_game(input: &[u8]) -> ! {
     if num_players < 2 || num_players > 10 || deck_size < 2 || timeout_blocks == 0 {
         return_status(STATUS_BAD_INPUT);
     }
+
+    // Card-set parsing
+    let safe_count = read_u16_be(input, 7);
+    let defuse_count = read_u16_be(input, 9);
+    let ek_count = read_u16_be(input, 11);
+    let custom_count = input[13] as usize;
+
+    if custom_count > MAX_CUSTOM_CARD_TYPES {
+        return_status(STATUS_BAD_CARD_SET);
+    }
+    let expected_input_len = 14 + custom_count * 22;
+    if input.len() < expected_input_len {
+        return_status(STATUS_BAD_INPUT);
+    }
+
+    let mut total: u32 = safe_count as u32 + defuse_count as u32 + ek_count as u32;
+    for i in 0..custom_count {
+        let off = 14 + i * 22;
+        // 20 bytes addr at off..off+20, then count u16 BE at off+20..off+22
+        let count = read_u16_be(input, off + 20);
+        total = total.saturating_add(count as u32);
+    }
+    if total != deck_size as u32 {
+        return_status(STATUS_BAD_CARD_SET);
+    }
+
+    // Persist the card-set blob exactly as received (header + entries).
+    store_card_set(&input[7..expected_input_len]);
 
     // Store timeout_blocks in deadline_block — it gets converted to an
     // absolute block number when registration completes.
@@ -471,6 +567,11 @@ fn msg_register_player(input: &[u8]) -> ! {
     let mut pk_bytes = Vec::new();
     pk.serialize_compressed(&mut pk_bytes).unwrap_or_else(|_| {});
     store_player_pk(idx, &pk_bytes);
+
+    // Variable-stake escrow: credit whatever value the caller attached.
+    // Card contracts will move balances within this escrow during play.
+    let deposit = value_transferred_u128();
+    store_escrow(idx, deposit);
 
     game.registered_count += 1;
 
@@ -626,6 +727,15 @@ fn msg_submit_reveal(input: &[u8]) -> ! {
     let count = load_reveal_count(card_index) + 1;
     store_reveal_count(card_index, count);
 
+    // STAGE 2 DISPATCH POINT: when count == game.num_players - 1, the card
+    // at card_index is now fully revealable. Look up its kind from the
+    // card-set (b"cset"), and if it's CUSTOM, call the registered card
+    // contract with the play context. Apply returned actions (Transfer,
+    // Explode, SkipTurn) to escrow / game state.
+    //
+    // Not implemented in Stage 1 — baseline mental-poker flow continues
+    // to work; custom card slots behave like Safe cards.
+
     // Note: we don't auto-transition to Complete here — the client tracks
     // which cards have been fully revealed. The game stays in Playing until
     // the client decides the game is over.
@@ -675,4 +785,22 @@ fn msg_query_game() -> ! {
             api::return_value(ReturnFlags::empty(), &output);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 0x11: query_escrow() → [num_players u8][escrow u128 LE × num_players]
+// ---------------------------------------------------------------------------
+fn msg_query_escrow() -> ! {
+    let num = match load_game() {
+        Some(g) => g.num_players,
+        None => 0,
+    };
+    let mut output = alloc::vec![0u8; 1 + (num as usize) * 16];
+    output[0] = num;
+    for p in 0..num {
+        let bal = load_escrow(p);
+        let off = 1 + (p as usize) * 16;
+        output[off..off + 16].copy_from_slice(&bal.to_le_bytes());
+    }
+    api::return_value(ReturnFlags::empty(), &output);
 }

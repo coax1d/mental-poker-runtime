@@ -163,7 +163,12 @@ function submitOnInclusion(
             resolve({ ok: ev.ok, events: ev.events ?? [] });
           } else if (!ev.isValid) {
             sub?.unsubscribe();
-            reject(new Error("tx dropped from pool (invalid)"));
+            reject(
+              new Error(
+                `tx dropped from pool (invalid): ${JSON.stringify(ev, (_k, v) =>
+                  typeof v === "bigint" ? v.toString() + "n" : v)}`,
+              ),
+            );
           }
         } else if (ev.type === "finalized") {
           // Fallback: if we somehow missed best-block state, resolve on finalized.
@@ -215,8 +220,25 @@ const SEL_QUERY_GAME = 0x10;
 
 // --- Extrinsic Helpers ---
 
+/** A custom card entry: a deployed card-contract address + the count of copies. */
+export interface CustomCardEntry {
+  /** 20-byte H160 (hex string with or without 0x prefix). */
+  address: string;
+  count: number;
+}
+
+/** Card composition of the deck. Must sum to deckSize. */
+export interface CardSet {
+  safeCount: number;
+  defuseCount: number;
+  ekCount: number;
+  customCards: CustomCardEntry[];
+}
+
 /**
  * Create a new game. Returns immediately (no game_id — single game per contract).
+ * Pass `cardSet` to use custom card contracts; default is all Safe cards (which
+ * matches the client's existing deterministic card-type assignment).
  */
 export async function createGame(
   conn: ChainConnection,
@@ -224,12 +246,51 @@ export async function createGame(
   deckSize: number,
   numPlayers: number,
   timeoutBlocks = 100,
+  cardSet?: CardSet,
 ): Promise<void> {
+  const cs: CardSet = cardSet ?? {
+    safeCount: deckSize,
+    defuseCount: 0,
+    ekCount: 0,
+    customCards: [],
+  };
+
+  const total =
+    cs.safeCount +
+    cs.defuseCount +
+    cs.ekCount +
+    cs.customCards.reduce((s, c) => s + c.count, 0);
+  if (total !== deckSize) {
+    throw new Error(
+      `Card-set total ${total} does not match deck size ${deckSize}`,
+    );
+  }
+
+  const cardSetParts: Uint8Array[] = [
+    u16be(cs.safeCount),
+    u16be(cs.defuseCount),
+    u16be(cs.ekCount),
+    new Uint8Array([cs.customCards.length]),
+  ];
+  for (const entry of cs.customCards) {
+    const hex = entry.address.startsWith("0x")
+      ? entry.address.slice(2)
+      : entry.address;
+    const addr = new Uint8Array(
+      hex.match(/.{2}/g)!.map((b) => parseInt(b, 16)),
+    );
+    if (addr.length !== 20) {
+      throw new Error(`Card-set address must be 20 bytes: ${entry.address}`);
+    }
+    cardSetParts.push(addr, u16be(entry.count));
+  }
+
   const data = concat(
     new Uint8Array([SEL_CREATE_GAME]),
     u16be(deckSize),
     new Uint8Array([numPlayers]),
     u32be(timeoutBlocks),
+    ...cardSetParts,
   );
   const result = await callContract(conn, signer, data);
   if (!result.ok) throw new Error("create_game failed (contract reverted)");
