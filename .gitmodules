@@ -1,0 +1,4 @@
+[submodule "mental-poker"]
+	path = mental-poker
+	url = https://github.com/coax1d/mental-poker.git
+	branch = fix-cards-error-js-class

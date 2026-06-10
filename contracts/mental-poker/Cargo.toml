@@ -22,10 +22,10 @@ panic = "abort"
 polkavm-derive = { version = "0.30" }
 uapi = { package = "pallet-revive-uapi", version = "0.11", default-features = false }
 
-cards-protocol = { path = "../../../mental-poker/protocol", default-features = false }
-cards-proofs = { path = "../../../mental-poker/proofs", default-features = false }
-cards-deck = { path = "../../../mental-poker/deck", default-features = false }
-deck-secp256k1 = { path = "../../../mental-poker/deck-secp256k1", default-features = false }
+cards-protocol = { path = "../../mental-poker/protocol", default-features = false }
+cards-proofs = { path = "../../mental-poker/proofs", default-features = false }
+cards-deck = { path = "../../mental-poker/deck", default-features = false }
+deck-secp256k1 = { path = "../../mental-poker/deck-secp256k1", default-features = false }
 
 ark-ec = { version = "0.5.0", default-features = false }
 ark-ff = { version = "0.5.0", default-features = false }

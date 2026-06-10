@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "build:wasm": "wasm-pack build ../../mental-poker/play --target web --features wasm && rm -rf src/wasm/pkg && cp -r ../../mental-poker/play/pkg src/wasm/pkg",
+    "build:wasm": "wasm-pack build ../mental-poker/play --target web --features wasm && rm -rf src/wasm/pkg && cp -r ../mental-poker/play/pkg src/wasm/pkg",
     "setup:papi": "node scripts/papi-add.mjs",
     "setup": "npm run build:wasm && npm run setup:papi"
   },

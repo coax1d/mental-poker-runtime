@@ -19,10 +19,16 @@ You'll need:
 - **A Polkadot wallet extension** — [Talisman](https://talisman.xyz/), [SubWallet](https://subwallet.app/), or [polkadot-js extension](https://polkadot.js.org/extension/)
 - **PAS** on Paseo Asset Hub — get it from [faucet.polkadot.io](https://faucet.polkadot.io/) → *Polkadot Testnet (Paseo)* → *Hub (Contracts)*
 
-The build also expects the upstream `mental-poker` protocol crate (Parity Tech) checked out next to this repo. The client's `build:wasm` script consumes it:
+The `mental-poker` protocol crate is included as a git submodule under `./mental-poker/`. Clone with submodules in one go:
 
 ```bash
-git clone https://github.com/paritytech/mental-poker.git ../mental-poker
+git clone --recurse-submodules https://github.com/coax1d/mental-poker-runtime.git
+```
+
+Already cloned? Pull the submodule:
+
+```bash
+git submodule update --init --recursive
 ```
 
 ### 1. Build the contract
