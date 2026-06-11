@@ -15,7 +15,7 @@ import {
 
 type Tab = "about" | "play";
 
-const DEFAULT_CONTRACT = "0x32b0a1aef9e8541feb28d2a1f9904fb7b01f71e9";
+const DEFAULT_CONTRACT = "0x5ff18e12c5a759b24b471b29e059a5da94c05787";
 const DEFAULT_WS = "wss://sys.ibp.network/asset-hub-paseo";
 
 export function App() {

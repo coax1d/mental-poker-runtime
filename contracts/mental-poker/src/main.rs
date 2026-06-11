@@ -347,7 +347,15 @@ fn has_reveal(card: u16, player_idx: u8) -> bool {
     let key = reveal_key(card, player_idx);
     let mut buf = [0u8; 1];
     let mut out: &mut [u8] = &mut buf;
-    api::get_storage(STORAGE, &key, &mut out).is_ok()
+    // clear_prior_game uses set_storage(key, &[]), so the key may exist
+    // with zero-length value after a reset. Treat that as "no reveal".
+    match api::get_storage(STORAGE, &key, &mut out) {
+        Ok(()) => {
+            let remaining = out.len();
+            buf.len() - remaining > 0
+        }
+        Err(_) => false,
+    }
 }
 
 fn reveal_count_key(card: u16) -> [u8; 4] {
