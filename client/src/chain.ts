@@ -32,19 +32,94 @@ export interface ChainConnection {
   contractAddress: string;
 }
 
-const DEFAULT_WS = "wss://sys.ibp.network/asset-hub-paseo";
+const FALLBACK_ENDPOINTS = [
+  "wss://sys.ibp.network/asset-hub-paseo",
+  "wss://asset-hub-paseo.dotters.network",
+  "wss://asset-hub-paseo-rpc.n.dwellir.com",
+];
 
-/** Connect to Paseo Asset Hub. */
+const PER_URL_TIMEOUT_MS = 10_000;
+
+const DEFAULT_WS = FALLBACK_ENDPOINTS[0];
+
+/**
+ * Connect to Paseo Asset Hub, trying the given URL first and falling
+ * through known-good fallback endpoints if one hangs or fails.
+ *
+ * Each attempt is bounded by a 10s timeout so a silently-unreachable
+ * endpoint can't deadlock the UI ("Connecting..." forever).
+ */
 export async function connect(
   contractAddress: string,
   wsUrl: string = DEFAULT_WS,
 ): Promise<ChainConnection> {
-  // Lazily import descriptors
   const { passet } = await import("@polkadot-api/descriptors");
+
+  const candidates: string[] = [];
+  if (wsUrl) candidates.push(wsUrl);
+  for (const url of FALLBACK_ENDPOINTS) {
+    if (!candidates.includes(url)) candidates.push(url);
+  }
+
+  let lastError: unknown;
+  for (const url of candidates) {
+    try {
+      // eslint-disable-next-line no-console
+      console.info(`[chain.connect] trying ${url}`);
+      const conn = await connectOne(url, contractAddress, passet);
+      // eslint-disable-next-line no-console
+      console.info(`[chain.connect] connected via ${url}`);
+      return conn;
+    } catch (err) {
+      lastError = err;
+      // eslint-disable-next-line no-console
+      console.warn(`[chain.connect] ${url} failed:`, err);
+    }
+  }
+  throw new Error(
+    `Could not connect to any Paseo Asset Hub endpoint. Last error: ${String(lastError)}`,
+  );
+}
+
+/** Single-URL connection attempt with a probe call to confirm the chain is responsive. */
+async function connectOne(
+  wsUrl: string,
+  contractAddress: string,
+  passet: Parameters<PolkadotClient["getTypedApi"]>[0],
+): Promise<ChainConnection> {
   const provider = getWsProvider(wsUrl);
   const client = createClient(provider);
   const api = client.getTypedApi(passet);
+
+  // Issue a cheap read to force the WS handshake to complete (or fail).
+  // getFinalizedBlock() resolves once the chain is reachable; reject if it
+  // takes too long so we can fall through to the next endpoint.
+  await withTimeout(
+    client.getFinalizedBlock(),
+    PER_URL_TIMEOUT_MS,
+    `${wsUrl} did not respond within ${PER_URL_TIMEOUT_MS / 1000}s`,
+  ).catch((err) => {
+    client.destroy();
+    throw err;
+  });
+
   return { client, api, contractAddress };
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(message)), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      },
+    );
+  });
 }
 
 /** Disconnect. */
